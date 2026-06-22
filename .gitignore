@@ -1,0 +1,39 @@
+# ── Foundry ──────────────────────────────────────────────────────────────────
+out/
+cache/
+broadcast/
+lib/
+
+# ── Hardhat (sub-directory) ───────────────────────────────────────────────────
+hardhat/node_modules/
+hardhat/artifacts/
+hardhat/cache/
+hardhat/deployments/
+
+# ── Environment / secrets ─────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+fireblocks_secret.key
+
+# ── Dependencies / build ──────────────────────────────────────────────────────
+node_modules/
+dist/
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+.cursor/
+.claude/
+*.iml
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log

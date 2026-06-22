@@ -1,0 +1,15 @@
+{
+  "name": "biliquid-contracts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Biliquid VIP Card — Foundry contracts + local dev scripts",
+  "scripts": {
+    "compile": "node scripts/compile.js",
+    "deploy:local": "node scripts/deploy-local.js",
+    "test:e2e": "node test/e2e.js"
+  },
+  "dependencies": {
+    "ethers": "^6.13.4",
+    "solc": "^0.8.26"
+  }
+}
