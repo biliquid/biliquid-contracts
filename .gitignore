@@ -4,12 +4,6 @@ cache/
 broadcast/
 lib/
 
-# ── Hardhat (sub-directory) ───────────────────────────────────────────────────
-hardhat/node_modules/
-hardhat/artifacts/
-hardhat/cache/
-hardhat/deployments/
-
 # ── Environment / secrets ─────────────────────────────────────────────────────
 .env
 .env.*

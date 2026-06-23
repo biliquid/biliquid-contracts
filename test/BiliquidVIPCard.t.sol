@@ -14,7 +14,7 @@ contract BiliquidVIPCardTest is Test {
     MockERC20       usdc;
     MockERC20       usdt;
 
-    // Chain: A(GeneralAgent) → B(SuperNode) → C(SuperNode) → D(Node) → E(Node) → F(User)
+    // Chain: A(GeneralAgent) -> B(SuperNode) -> C(SuperNode) -> D(Node) -> E(Node) -> F(User)
     address treasury = makeAddr("treasury");
     address A        = makeAddr("A"); // GeneralAgent
     address B        = makeAddr("B"); // SuperNode
@@ -25,7 +25,13 @@ contract BiliquidVIPCardTest is Test {
 
     uint256 constant GOLD_PRICE   = 30_000_000;  // 30 USDC (6 dec)
     uint256 constant MINT_POINTS  = 10_000;
-    uint256 constant MERGE_POINTS = 4_000;       // Gold→Platinum
+    uint256 constant MERGE_POINTS = 4_000;       // Gold->Platinum
+
+    // Token ID constants — avoids vm.prank being consumed by card.GOLD() staticcall
+    uint8 constant GOLD_ID     = 1;
+    uint8 constant PLATINUM_ID = 2;
+    uint8 constant DIAMOND_ID  = 3;
+    uint8 constant BLACK_ID    = 4;
 
     function setUp() public {
         usdc = new MockERC20("USD Coin", "USDC", 6);
@@ -66,19 +72,19 @@ contract BiliquidVIPCardTest is Test {
     }
 
     function test_Referral_Tree_Links() public view {
-        assertEq(card.referrerOf(F), E, "F→E");
-        assertEq(card.referrerOf(E), D, "E→D");
-        assertEq(card.referrerOf(D), C, "D→C");
-        assertEq(card.referrerOf(C), B, "C→B");
-        assertEq(card.referrerOf(B), A, "B→A");
-        assertEq(card.referrerOf(A), address(0), "A→none");
+        assertEq(card.referrerOf(F), E, "F->E");
+        assertEq(card.referrerOf(E), D, "E->D");
+        assertEq(card.referrerOf(D), C, "D->C");
+        assertEq(card.referrerOf(C), B, "C->B");
+        assertEq(card.referrerOf(B), A, "B->A");
+        assertEq(card.referrerOf(A), address(0), "A->none");
     }
 
     /// @dev Cycle impossible: A is already registered, can never re-register
     function test_AntiCycle_AlreadyRegistered() public {
         vm.prank(A);
         vm.expectRevert("already registered");
-        card.register(F); // would create A→F (but A is already registered)
+        card.register(F); // would create A->F (but A is already registered)
     }
 
     /// @dev Registering under an unregistered address is rejected
@@ -144,7 +150,7 @@ contract BiliquidVIPCardTest is Test {
         assertEq(card.points(D), 500,   "D pts");
         // C: superNode 5% = 500
         assertEq(card.points(C), 500,   "C pts");
-        // B: same-level as C (both SuperNode) → 0
+        // B: same-level as C (both SuperNode) -> 0
         assertEq(card.points(B), 0,     "B pts (same-level, no reward)");
         // A: generalAgent 5% = 500
         assertEq(card.points(A), 500,   "A pts");
@@ -177,7 +183,7 @@ contract BiliquidVIPCardTest is Test {
         uint256 treasuryBefore = usdc.balanceOf(treasury);
         vm.prank(G); card.mint(1, false);
 
-        // No referrer → all 30 USDC stays in contract (treasury withdraws later)
+        // No referrer -> all 30 USDC stays in contract (treasury withdraws later)
         // Points only go to G
         assertEq(card.points(G), MINT_POINTS, "G pts");
         // No USDC distributed to any referrer
@@ -189,18 +195,18 @@ contract BiliquidVIPCardTest is Test {
     function test_Merge_GoldToPlatinum_NFTState() public {
         vm.prank(F); card.mint(4, false);
         vm.prank(F); card.setApprovalForAll(address(card), true);
-        vm.prank(F); card.merge(card.PLATINUM());
+        vm.prank(F); card.merge(PLATINUM_ID);
 
-        assertEq(card.balanceOf(F, card.GOLD()),     0, "F gold=0");
-        assertEq(card.balanceOf(F, card.PLATINUM()), 1, "F plat=1");
-        assertEq(card.balanceOf(treasury, card.GOLD()), 4, "treasury holds 4 Gold");
+        assertEq(card.balanceOf(F, GOLD_ID),     0, "F gold=0");
+        assertEq(card.balanceOf(F, PLATINUM_ID), 1, "F plat=1");
+        assertEq(card.balanceOf(treasury, GOLD_ID), 4, "treasury holds 4 Gold");
     }
 
     function test_Merge_GoldToPlatinum_MergerPoints() public {
         vm.prank(F); card.mint(4, false);
         uint256 ptsBefore = card.points(F);
         vm.prank(F); card.setApprovalForAll(address(card), true);
-        vm.prank(F); card.merge(card.PLATINUM());
+        vm.prank(F); card.merge(PLATINUM_ID);
         assertEq(card.points(F), ptsBefore + MERGE_POINTS, "F merge pts");
     }
 
@@ -214,7 +220,7 @@ contract BiliquidVIPCardTest is Test {
         uint256 bBefore = card.points(B);
         uint256 aBefore = card.points(A);
 
-        vm.prank(F); card.merge(card.PLATINUM());
+        vm.prank(F); card.merge(PLATINUM_ID);
 
         // E: direct 10% + nodeBoost 5% = 400+200 = 600
         assertEq(card.points(E) - eBefore, 600, "E merge pts");
@@ -222,17 +228,17 @@ contract BiliquidVIPCardTest is Test {
         assertEq(card.points(D) - dBefore, 200, "D merge pts");
         // C: superNode 5% = 200
         assertEq(card.points(C) - cBefore, 200, "C merge pts");
-        // B: same-level → 0
+        // B: same-level -> 0
         assertEq(card.points(B) - bBefore, 0,   "B merge pts (same-level)");
         // A: generalAgent 5% = 200
         assertEq(card.points(A) - aBefore, 200, "A merge pts");
     }
 
     function test_Merge_RevertIfInsufficientCards() public {
-        // F has 0 Gold
+        // F has 0 Gold — pre-compute PLATINUM_ID to avoid staticcall consuming vm.expectRevert
         vm.prank(F); card.setApprovalForAll(address(card), true);
         vm.expectRevert("insufficient cards");
-        vm.prank(F); card.merge(card.PLATINUM());
+        vm.prank(F); card.merge(PLATINUM_ID);
     }
 
     // ── Staking Tests ─────────────────────────────────────────────────────────
@@ -240,26 +246,26 @@ contract BiliquidVIPCardTest is Test {
     function test_Stake_LocksNFT() public {
         vm.prank(F); card.mint(1, false);
         vm.prank(F); card.setApprovalForAll(address(card), true);
-        vm.prank(F); card.stake(card.GOLD(), 1);
+        vm.prank(F); card.stake(GOLD_ID, 1);
 
-        assertEq(card.balanceOf(F, card.GOLD()),          0, "free=0");
-        assertEq(card.stakedBalance(F, card.GOLD()),      1, "staked=1");
+        assertEq(card.balanceOf(F, GOLD_ID),          0, "free=0");
+        assertEq(card.stakedBalance(F, GOLD_ID),      1, "staked=1");
     }
 
     function test_Unstake_ReturnsNFT() public {
         vm.prank(F); card.mint(1, false);
         vm.prank(F); card.setApprovalForAll(address(card), true);
-        vm.prank(F); card.stake(card.GOLD(), 1);
-        vm.prank(F); card.unstake(card.GOLD(), 1);
+        vm.prank(F); card.stake(GOLD_ID, 1);
+        vm.prank(F); card.unstake(GOLD_ID, 1);
 
-        assertEq(card.balanceOf(F, card.GOLD()),     1, "restored");
-        assertEq(card.stakedBalance(F, card.GOLD()), 0, "staked=0");
+        assertEq(card.balanceOf(F, GOLD_ID),     1, "restored");
+        assertEq(card.stakedBalance(F, GOLD_ID), 0, "staked=0");
     }
 
     function test_DailyInterest_Gold() public {
         vm.prank(F); card.mint(1, false);
         vm.prank(F); card.setApprovalForAll(address(card), true);
-        vm.prank(F); card.stake(card.GOLD(), 1);
+        vm.prank(F); card.stake(GOLD_ID, 1);
 
         // Gold: principal=30_000_000, apyBps=900
         // daily = 30_000_000 * 1 * 900 / 10_000 / 365
@@ -271,8 +277,8 @@ contract BiliquidVIPCardTest is Test {
         // Give F a Platinum directly via 4x mint + merge
         vm.prank(F); card.mint(4, false);
         vm.prank(F); card.setApprovalForAll(address(card), true);
-        vm.prank(F); card.merge(card.PLATINUM());
-        vm.prank(F); card.stake(card.PLATINUM(), 1);
+        vm.prank(F); card.merge(PLATINUM_ID);
+        vm.prank(F); card.stake(PLATINUM_ID, 1);
 
         // Platinum: principal=120_000_000, apyBps=1000
         uint256 expected = (uint256(120_000_000) * 1000) / 10_000 / 365;
@@ -326,7 +332,7 @@ contract BiliquidVIPCardTest is Test {
 
         // Merge
         vm.prank(F); card.setApprovalForAll(address(card), true);
-        vm.prank(F); card.merge(card.PLATINUM());
+        vm.prank(F); card.merge(PLATINUM_ID);
 
         assertEq(card.points(F), MINT_POINTS * 4 + MERGE_POINTS, "F total pts");
         assertEq(card.points(E), 1_500 * 4 + 600,                "E total pts");
