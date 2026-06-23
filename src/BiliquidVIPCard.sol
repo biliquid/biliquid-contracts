@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 /**
  * @title BiliquidVIPCard
- * @notice ERC-1155 VIP membership card protocol.
+ * @notice ERC-1155 VIP membership card protocol — UUPS upgradeable.
  *
  * ── Design Philosophy ───────────────────────────────────────────────────────
  * ALL user-facing state is stored on-chain and readable via view functions.
@@ -29,7 +29,16 @@ pragma solidity ^0.8.24;
  * ── Merge Rewards ────────────────────────────────────────────────────────────
  *   Same tree walk, points only (no USDC).
  *   Source cards sent to treasury (not burned).
+ *
+ * ── Upgradeability ───────────────────────────────────────────────────────────
+ *   UUPS proxy pattern (EIP-1822). Only owner can authorise upgrades.
+ *   Deploy via: new ERC1967Proxy(impl, abi.encodeCall(initialize, (usdc, treasury)))
  */
+
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 interface IERC20 {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
@@ -37,30 +46,25 @@ interface IERC20 {
     function balanceOf(address account) external view returns (uint256);
 }
 
-contract BiliquidVIPCard {
-
+contract BiliquidVIPCard is
+    Initializable,
+    OwnableUpgradeable,
+    ReentrancyGuard,
+    UUPSUpgradeable
+{
     // ─── ERC-1155 storage ────────────────────────────────────────────────────
     mapping(address => mapping(uint256 => uint256)) private _balances;
     mapping(address => mapping(address => bool))    private _operatorApprovals;
-    string public uri = "https://biliquid.io/metadata/{id}.json";
+    string public uri;
 
     event TransferSingle(address indexed operator, address indexed from, address indexed to, uint256 id, uint256 value);
     event TransferBatch (address indexed operator, address indexed from, address indexed to, uint256[] ids, uint256[] values);
     event ApprovalForAll(address indexed account, address indexed operator, bool approved);
 
     // ─── Access ───────────────────────────────────────────────────────────────
-    address public owner;
-    bool    public paused;
-    bool    private _entered;
+    bool public paused;
 
-    modifier onlyOwner()    { require(msg.sender == owner, "not owner");  _; }
-    modifier notPaused()    { require(!paused,             "paused");     _; }
-    modifier nonReentrant() {
-        require(!_entered, "reentrant");
-        _entered = true;
-        _;
-        _entered = false;
-    }
+    modifier notPaused() { require(!paused, "paused"); _; }
 
     // ─── Token IDs ────────────────────────────────────────────────────────────
     uint8 public constant GOLD      = 1;
@@ -76,7 +80,7 @@ contract BiliquidVIPCard {
 
     // ─── Tier Config ──────────────────────────────────────────────────────────
     struct TierConfig {
-        uint256 mintPrice;      // payment token (6 dec USDC); 0 = not directly purchasable
+        uint256 mintPrice;      // USDC (6 dec); 0 = not directly purchasable
         uint256 mintPoints;     // points awarded to buyer on mint
         uint256 mergePoints;    // points awarded on merge into this tier
         uint8   mergeRequires;  // number of source cards to consume
@@ -86,9 +90,8 @@ contract BiliquidVIPCard {
     }
     mapping(uint8 => TierConfig) public tierConfigs;
 
-    // ─── Payment tokens ───────────────────────────────────────────────────────
+    // ─── Payment token ────────────────────────────────────────────────────────
     IERC20  public usdc;
-    IERC20  public usdt;
     address public treasury;
 
     // ─── Referral ─────────────────────────────────────────────────────────────
@@ -103,21 +106,19 @@ contract BiliquidVIPCard {
      *   1 = root (registered with no referrer)
      *   2+ = registered under a referrer at depth n → own depth = n+1
      *
-     * Why this prevents cycles (O(1), no chain-walk needed):
-     *   - Depth is strictly monotone: child.depth > parent.depth always
-     *   - To register under someone, that person must already have depth > 0
-     *   - Therefore you can never become the ancestor of your own ancestor
-     *   - Proof: if A.depth=2 and B wants to register under A, B.depth=3.
-     *     A can never later register under B because A is already registered.
+     * Anti-cycle guarantee (O(1), no chain-walk):
+     *   depth is strictly monotone: child.depth > parent.depth always.
+     *   Since registration is one-time and requires parent to be registered first,
+     *   cycles are mathematically impossible.
      */
     mapping(address => uint256) public registrationDepth;
     uint256 public constant MAX_REFERRAL_DEPTH = 20;
 
-    uint256 public directReferralBps    = 1000; // 10%
-    uint256 public indirectReferralBps  =  500; //  5%
-    uint256 public nodeBoostBps         =  500; //  5%
-    uint256 public superNodeBps         =  500; //  5%
-    uint256 public generalAgentBps      =  500; //  5%
+    uint256 public directReferralBps;
+    uint256 public indirectReferralBps;
+    uint256 public nodeBoostBps;
+    uint256 public superNodeBps;
+    uint256 public generalAgentBps;
 
     // ─── Points (on-chain) ────────────────────────────────────────────────────
     mapping(address => uint256) public points;
@@ -136,12 +137,24 @@ contract BiliquidVIPCard {
     event Unstaked      (address indexed staker, uint8 tokenId, uint256 amount);
     event TierUpdated   (uint8 tokenId);
 
-    // ─── Constructor ──────────────────────────────────────────────────────────
-    constructor(address _usdc, address _usdt, address _treasury) {
-        owner    = msg.sender;
+    // ─── Constructor (disabled — use initialize) ──────────────────────────────
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    // ─── Initializer (replaces constructor for upgradeable proxy) ────────────
+    function initialize(address _usdc, address _treasury) external initializer {
+        __Ownable_init(msg.sender);
+
         usdc     = IERC20(_usdc);
-        usdt     = IERC20(_usdt);
+        directReferralBps   = 1000; // 10%
+        indirectReferralBps =  500; //  5%
+        nodeBoostBps        =  500; //  5%
+        superNodeBps        =  500; //  5%
+        generalAgentBps     =  500; //  5%
         treasury = _treasury;
+        uri      = "https://biliquid.io/metadata/{id}.json";
 
         tierConfigs[GOLD] = TierConfig({
             mintPrice:     30_000_000,   // 30 USDC
@@ -181,26 +194,19 @@ contract BiliquidVIPCard {
         });
     }
 
+    // ─── UUPS upgrade authorisation ───────────────────────────────────────────
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+
     // ─── Registration ─────────────────────────────────────────────────────────
     /**
      * @notice Register and optionally bind a referrer. One-time, immutable.
      *         Must be called before minting to receive referral attribution.
-     *
      * @param referrer  Your referrer's address, or address(0) to join as root.
-     *
-     * Anti-cycle guarantee — O(1), no chain-walk:
-     *   registrationDepth is strictly monotone: child.depth = parent.depth + 1.
-     *   Because registration is one-time and requires parent to exist first,
-     *   it is mathematically impossible for any cycle to form:
-     *     - To be your referrer, someone must already be registered (depth > 0)
-     *     - Your depth = their depth + 1 (always greater)
-     *     - They can never register under you later (they're already registered)
      */
     function register(address referrer) external {
         require(registrationDepth[msg.sender] == 0, "already registered");
 
         if (referrer == address(0)) {
-            // Root: join without a referrer; rewards for this user go to treasury
             registrationDepth[msg.sender] = 1;
         } else {
             require(referrer != msg.sender, "self-refer");
@@ -222,19 +228,18 @@ contract BiliquidVIPCard {
     }
 
     // ─── Mint ─────────────────────────────────────────────────────────────────
-    function mint(uint256 amount, bool useUsdt) external notPaused nonReentrant {
+    function mint(uint256 amount) external notPaused nonReentrant {
         require(amount > 0, "amount=0");
         TierConfig storage cfg = tierConfigs[GOLD];
         uint256 totalCost = cfg.mintPrice * amount;
-        IERC20  token     = useUsdt ? usdt : usdc;
 
-        require(token.transferFrom(msg.sender, address(this), totalCost), "payment failed");
+        require(usdc.transferFrom(msg.sender, address(this), totalCost), "payment failed");
 
         _mint(msg.sender, GOLD, amount);
 
         uint256 earnedPts = cfg.mintPoints * amount;
         _addPoints(msg.sender, earnedPts, "mint");
-        _distributeReferralRewards(msg.sender, totalCost, earnedPts, token);
+        _distributeReferralRewards(msg.sender, totalCost, earnedPts);
 
         emit Minted(msg.sender, GOLD, amount, earnedPts);
     }
@@ -247,7 +252,7 @@ contract BiliquidVIPCard {
         uint256 needed   = cfg.mergeRequires;
         require(_balances[msg.sender][fromTier] >= needed, "insufficient cards");
 
-        _transfer(msg.sender, treasury, fromTier, needed);   // → treasury
+        _transfer(msg.sender, treasury, fromTier, needed);
         _mint(msg.sender, targetTier, 1);
 
         uint256 mpts = cfg.mergePoints;
@@ -274,7 +279,6 @@ contract BiliquidVIPCard {
     }
 
     // ─── View functions (RPC-queryable) ───────────────────────────────────────
-
     function getUserState(address wallet) external view returns (
         uint256 pts,
         uint256 freeGold,     uint256 freePlatinum,   uint256 freeDiamond,   uint256 freeBlack,
@@ -373,9 +377,9 @@ contract BiliquidVIPCard {
         emit TierUpdated(tokenId);
     }
 
-    function setTreasury(address _treasury)          external onlyOwner { treasury = _treasury; }
-    function setPaused(bool _paused)                 external onlyOwner { paused   = _paused;   }
-    function transferOwnership(address newOwner)     external onlyOwner { owner    = newOwner;  }
+    function setUsdc(address _usdc)           external onlyOwner { usdc     = IERC20(_usdc); }
+    function setTreasury(address _treasury)   external onlyOwner { treasury = _treasury; }
+    function setPaused(bool _paused)          external onlyOwner { paused   = _paused; }
 
     function setReferralRates(
         uint256 _direct, uint256 _indirect, uint256 _nodeBoost,
@@ -417,7 +421,6 @@ contract BiliquidVIPCard {
 
     /**
      * @dev On mint: walk referral tree, pay USDC + points.
-     *
      *   L1 = direct referrer     → direct(10%) [+ nodeBoost(5%) if Node+]
      *   L2 = referrer of L1      → indirect(5%)
      *   ancestors above L2:
@@ -425,19 +428,19 @@ contract BiliquidVIPCard {
      *     first  GeneralAgent   → generalAgent(5%)
      */
     function _distributeReferralRewards(
-        address buyer, uint256 totalUsdc, uint256 buyerPts, IERC20 token
+        address buyer, uint256 totalUsdc, uint256 buyerPts
     ) internal {
         address l1 = referrerOf[buyer];
         if (l1 == address(0)) return;
 
         _payReferral(l1, buyer,
             _bps(totalUsdc, directReferralBps), _bps(buyerPts, directReferralBps),
-            token, "direct");
+            "direct");
 
         if (roleOf[l1] >= ROLE_NODE) {
             _payReferral(l1, buyer,
                 _bps(totalUsdc, nodeBoostBps), _bps(buyerPts, nodeBoostBps),
-                token, "node_boost");
+                "node_boost");
         }
 
         address l2 = referrerOf[l1];
@@ -445,7 +448,7 @@ contract BiliquidVIPCard {
 
         _payReferral(l2, buyer,
             _bps(totalUsdc, indirectReferralBps), _bps(buyerPts, indirectReferralBps),
-            token, "indirect");
+            "indirect");
 
         bool snPaid = false;
         bool gaPaid = false;
@@ -455,13 +458,13 @@ contract BiliquidVIPCard {
             if (!snPaid && r >= ROLE_SUPERNODE) {
                 _payReferral(cur, buyer,
                     _bps(totalUsdc, superNodeBps), _bps(buyerPts, superNodeBps),
-                    token, "supernode");
+                    "supernode");
                 snPaid = true;
             }
             if (!gaPaid && r >= ROLE_GENERAL_AGENT) {
                 _payReferral(cur, buyer,
                     _bps(totalUsdc, generalAgentBps), _bps(buyerPts, generalAgentBps),
-                    token, "general_agent");
+                    "general_agent");
                 gaPaid = true;
             }
             cur = referrerOf[cur];
@@ -488,11 +491,11 @@ contract BiliquidVIPCard {
         while (cur != address(0) && !(snPaid && gaPaid)) {
             uint8 r = roleOf[cur];
             if (!snPaid && r >= ROLE_SUPERNODE) {
-                _addPoints(cur, _bps(mPts, superNodeBps),      "merge_supernode");
+                _addPoints(cur, _bps(mPts, superNodeBps),    "merge_supernode");
                 snPaid = true;
             }
             if (!gaPaid && r >= ROLE_GENERAL_AGENT) {
-                _addPoints(cur, _bps(mPts, generalAgentBps),   "merge_general_agent");
+                _addPoints(cur, _bps(mPts, generalAgentBps), "merge_general_agent");
                 gaPaid = true;
             }
             cur = referrerOf[cur];
@@ -502,9 +505,9 @@ contract BiliquidVIPCard {
     function _payReferral(
         address recipient, address buyer,
         uint256 usdcAmt, uint256 ptsAmt,
-        IERC20 token, string memory reason
+        string memory reason
     ) internal {
-        if (usdcAmt > 0) token.transfer(recipient, usdcAmt);
+        if (usdcAmt > 0) usdc.transfer(recipient, usdcAmt);
         if (ptsAmt  > 0) _addPoints(recipient, ptsAmt, reason);
         emit ReferralReward(recipient, buyer, usdcAmt, ptsAmt, reason);
     }

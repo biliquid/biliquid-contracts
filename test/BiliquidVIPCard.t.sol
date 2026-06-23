@@ -2,17 +2,16 @@
 pragma solidity ^0.8.24;
 
 // Run: forge test --match-path test/BiliquidVIPCard.t.sol -vvv
-// Requires: forge install foundry-rs/forge-std --no-commit
 
 import "forge-std/Test.sol";
+import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import "../src/BiliquidVIPCard.sol";
 import "../src/MockERC20.sol";
 
 contract BiliquidVIPCardTest is Test {
 
-    BiliquidVIPCard card;
+    BiliquidVIPCard card; // points to the proxy, cast to impl interface
     MockERC20       usdc;
-    MockERC20       usdt;
 
     // Chain: A(GeneralAgent) -> B(SuperNode) -> C(SuperNode) -> D(Node) -> E(Node) -> F(User)
     address treasury = makeAddr("treasury");
@@ -35,10 +34,14 @@ contract BiliquidVIPCardTest is Test {
 
     function setUp() public {
         usdc = new MockERC20("USD Coin", "USDC", 6);
-        usdt = new MockERC20("Tether",   "USDT", 6);
-        card = new BiliquidVIPCard(address(usdc), address(usdt), treasury);
 
-        // Roles (called as deployer = address(this) = owner)
+        // Deploy implementation + UUPS proxy
+        BiliquidVIPCard impl = new BiliquidVIPCard();
+        bytes memory initData = abi.encodeCall(BiliquidVIPCard.initialize, (address(usdc), treasury));
+        ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
+        card = BiliquidVIPCard(address(proxy));
+
+        // Roles (called as address(this) = owner)
         card.setRole(A, 3); // GeneralAgent
         card.setRole(B, 2); // SuperNode
         card.setRole(C, 2); // SuperNode
@@ -46,7 +49,6 @@ contract BiliquidVIPCardTest is Test {
         card.setRole(E, 1); // Node
 
         // Build referral tree — each person must register BEFORE their downstream
-        // A registers as root first
         vm.prank(A); card.register(address(0));   // A: root, depth=1
         vm.prank(B); card.register(A);            // B: depth=2
         vm.prank(C); card.register(B);            // C: depth=3
@@ -93,7 +95,7 @@ contract BiliquidVIPCardTest is Test {
         address newUser  = makeAddr("newUser");
         vm.prank(newUser);
         vm.expectRevert("referrer not registered");
-        card.register(stranger); // stranger never called register()
+        card.register(stranger);
     }
 
     function test_AntiCycle_SelfRefer() public {
@@ -106,13 +108,12 @@ contract BiliquidVIPCardTest is Test {
     function test_AntiCycle_RootRegister() public {
         address newUser = makeAddr("newUser");
         vm.prank(newUser);
-        card.register(address(0)); // root — always allowed
+        card.register(address(0));
         assertEq(card.registrationDepth(newUser), 1);
         assertEq(card.referrerOf(newUser), address(0));
     }
 
     function test_AntiCycle_ChainTooDeep() public {
-        // Build a chain of MAX_REFERRAL_DEPTH nodes, then try to add one more
         uint256 maxDepth = card.MAX_REFERRAL_DEPTH();
         address prev = makeAddr("depth_root");
         vm.prank(prev); card.register(address(0));
@@ -122,7 +123,6 @@ contract BiliquidVIPCardTest is Test {
             vm.prank(next); card.register(prev);
             prev = next;
         }
-        // prev is now at depth = maxDepth; trying to register one more should fail
         address tooDeep = makeAddr("tooDeep");
         vm.prank(tooDeep);
         vm.expectRevert("chain too deep");
@@ -132,17 +132,17 @@ contract BiliquidVIPCardTest is Test {
     // ── Mint Tests ────────────────────────────────────────────────────────────
 
     function test_Mint_OneGold_NFTBalance() public {
-        vm.prank(F); card.mint(1, false);
+        vm.prank(F); card.mint(1);
         assertEq(card.balanceOf(F, card.GOLD()), 1, "F gold");
     }
 
     function test_Mint_OneGold_BuyerPoints() public {
-        vm.prank(F); card.mint(1, false);
+        vm.prank(F); card.mint(1);
         assertEq(card.points(F), MINT_POINTS, "F pts");
     }
 
     function test_Mint_OneGold_ReferralPoints() public {
-        vm.prank(F); card.mint(1, false);
+        vm.prank(F); card.mint(1);
 
         // E: direct(10%=1000) + nodeBoost(5%=500) = 1500
         assertEq(card.points(E), 1_500, "E pts");
@@ -157,7 +157,7 @@ contract BiliquidVIPCardTest is Test {
     }
 
     function test_Mint_OneGold_ReferralUsdc() public {
-        vm.prank(F); card.mint(1, false);
+        vm.prank(F); card.mint(1);
 
         // E: 3 USDC (direct) + 1.5 USDC (nodeBoost) = 4.5 USDC
         assertEq(usdc.balanceOf(E), 4_500_000, "E usdc");
@@ -174,26 +174,22 @@ contract BiliquidVIPCardTest is Test {
     }
 
     function test_Mint_NoReferrer_RewardsToTreasury() public {
-        // G has no referrer (registered as root)
         address G = makeAddr("G");
         usdc.mint(G, 100_000_000);
         vm.prank(G); usdc.approve(address(card), type(uint256).max);
         vm.prank(G); card.register(address(0));
 
         uint256 treasuryBefore = usdc.balanceOf(treasury);
-        vm.prank(G); card.mint(1, false);
+        vm.prank(G); card.mint(1);
 
-        // No referrer -> all 30 USDC stays in contract (treasury withdraws later)
-        // Points only go to G
         assertEq(card.points(G), MINT_POINTS, "G pts");
-        // No USDC distributed to any referrer
         assertEq(usdc.balanceOf(treasury), treasuryBefore, "treasury unchanged");
     }
 
     // ── Merge Tests ───────────────────────────────────────────────────────────
 
     function test_Merge_GoldToPlatinum_NFTState() public {
-        vm.prank(F); card.mint(4, false);
+        vm.prank(F); card.mint(4);
         vm.prank(F); card.setApprovalForAll(address(card), true);
         vm.prank(F); card.merge(PLATINUM_ID);
 
@@ -203,7 +199,7 @@ contract BiliquidVIPCardTest is Test {
     }
 
     function test_Merge_GoldToPlatinum_MergerPoints() public {
-        vm.prank(F); card.mint(4, false);
+        vm.prank(F); card.mint(4);
         uint256 ptsBefore = card.points(F);
         vm.prank(F); card.setApprovalForAll(address(card), true);
         vm.prank(F); card.merge(PLATINUM_ID);
@@ -211,7 +207,7 @@ contract BiliquidVIPCardTest is Test {
     }
 
     function test_Merge_GoldToPlatinum_ReferralPoints() public {
-        vm.prank(F); card.mint(4, false);
+        vm.prank(F); card.mint(4);
         vm.prank(F); card.setApprovalForAll(address(card), true);
 
         uint256 eBefore = card.points(E);
@@ -235,7 +231,6 @@ contract BiliquidVIPCardTest is Test {
     }
 
     function test_Merge_RevertIfInsufficientCards() public {
-        // F has 0 Gold — pre-compute PLATINUM_ID to avoid staticcall consuming vm.expectRevert
         vm.prank(F); card.setApprovalForAll(address(card), true);
         vm.expectRevert("insufficient cards");
         vm.prank(F); card.merge(PLATINUM_ID);
@@ -244,16 +239,16 @@ contract BiliquidVIPCardTest is Test {
     // ── Staking Tests ─────────────────────────────────────────────────────────
 
     function test_Stake_LocksNFT() public {
-        vm.prank(F); card.mint(1, false);
+        vm.prank(F); card.mint(1);
         vm.prank(F); card.setApprovalForAll(address(card), true);
         vm.prank(F); card.stake(GOLD_ID, 1);
 
-        assertEq(card.balanceOf(F, GOLD_ID),          0, "free=0");
-        assertEq(card.stakedBalance(F, GOLD_ID),      1, "staked=1");
+        assertEq(card.balanceOf(F, GOLD_ID),     0, "free=0");
+        assertEq(card.stakedBalance(F, GOLD_ID), 1, "staked=1");
     }
 
     function test_Unstake_ReturnsNFT() public {
-        vm.prank(F); card.mint(1, false);
+        vm.prank(F); card.mint(1);
         vm.prank(F); card.setApprovalForAll(address(card), true);
         vm.prank(F); card.stake(GOLD_ID, 1);
         vm.prank(F); card.unstake(GOLD_ID, 1);
@@ -263,24 +258,20 @@ contract BiliquidVIPCardTest is Test {
     }
 
     function test_DailyInterest_Gold() public {
-        vm.prank(F); card.mint(1, false);
+        vm.prank(F); card.mint(1);
         vm.prank(F); card.setApprovalForAll(address(card), true);
         vm.prank(F); card.stake(GOLD_ID, 1);
 
-        // Gold: principal=30_000_000, apyBps=900
-        // daily = 30_000_000 * 1 * 900 / 10_000 / 365
         uint256 expected = (uint256(30_000_000) * 900) / 10_000 / 365;
         assertEq(card.dailyInterest(F), expected, "gold daily interest");
     }
 
     function test_DailyInterest_Platinum() public {
-        // Give F a Platinum directly via 4x mint + merge
-        vm.prank(F); card.mint(4, false);
+        vm.prank(F); card.mint(4);
         vm.prank(F); card.setApprovalForAll(address(card), true);
         vm.prank(F); card.merge(PLATINUM_ID);
         vm.prank(F); card.stake(PLATINUM_ID, 1);
 
-        // Platinum: principal=120_000_000, apyBps=1000
         uint256 expected = (uint256(120_000_000) * 1000) / 10_000 / 365;
         assertEq(card.dailyInterest(F), expected, "platinum daily interest");
     }
@@ -288,7 +279,7 @@ contract BiliquidVIPCardTest is Test {
     // ── getUserState Tests ────────────────────────────────────────────────────
 
     function test_GetUserState_Snapshot() public {
-        vm.prank(F); card.mint(1, false);
+        vm.prank(F); card.mint(1);
 
         (
             uint256 pts,
@@ -314,15 +305,14 @@ contract BiliquidVIPCardTest is Test {
     // ── Full Scenario Test ────────────────────────────────────────────────────
 
     function test_FullScenario_FourMintsAndMerge() public {
-        // 4 mints
-        vm.prank(F); card.mint(4, false);
+        vm.prank(F); card.mint(4);
 
         assertEq(card.points(F), MINT_POINTS * 4,   "F pts after 4 mints");
         assertEq(card.points(E), 1_500 * 4,         "E pts after 4 mints");
-        assertEq(card.points(D), 500 * 4,            "D pts after 4 mints");
-        assertEq(card.points(C), 500 * 4,            "C pts after 4 mints");
-        assertEq(card.points(B), 0,                  "B pts always 0");
-        assertEq(card.points(A), 500 * 4,            "A pts after 4 mints");
+        assertEq(card.points(D), 500 * 4,           "D pts after 4 mints");
+        assertEq(card.points(C), 500 * 4,           "C pts after 4 mints");
+        assertEq(card.points(B), 0,                 "B pts always 0");
+        assertEq(card.points(A), 500 * 4,           "A pts after 4 mints");
 
         assertEq(usdc.balanceOf(E), 4_500_000 * 4,  "E usdc after 4 mints");
         assertEq(usdc.balanceOf(D), 1_500_000 * 4,  "D usdc after 4 mints");
@@ -330,7 +320,6 @@ contract BiliquidVIPCardTest is Test {
         assertEq(usdc.balanceOf(B), 0,              "B usdc always 0");
         assertEq(usdc.balanceOf(A), 1_500_000 * 4,  "A usdc after 4 mints");
 
-        // Merge
         vm.prank(F); card.setApprovalForAll(address(card), true);
         vm.prank(F); card.merge(PLATINUM_ID);
 
@@ -343,5 +332,27 @@ contract BiliquidVIPCardTest is Test {
 
         // Contract holds: 120 paid - 36 distributed = 84 USDC
         assertEq(usdc.balanceOf(address(card)), 84_000_000, "contract net usdc");
+    }
+
+    // ── Upgrade Tests ─────────────────────────────────────────────────────────
+
+    function test_Upgrade_OnlyOwner() public {
+        BiliquidVIPCard impl2 = new BiliquidVIPCard();
+        vm.prank(F);
+        vm.expectRevert();
+        card.upgradeToAndCall(address(impl2), "");
+    }
+
+    function test_Upgrade_OwnerCanUpgrade() public {
+        // Deploy new impl and upgrade — state should persist
+        vm.prank(F); card.mint(1);
+        assertEq(card.balanceOf(F, GOLD_ID), 1, "before upgrade");
+
+        BiliquidVIPCard impl2 = new BiliquidVIPCard();
+        // address(this) is the owner (setUp deployer)
+        card.upgradeToAndCall(address(impl2), "");
+
+        // State preserved across upgrade
+        assertEq(card.balanceOf(F, GOLD_ID), 1, "after upgrade");
     }
 }
