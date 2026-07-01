@@ -1,358 +1,890 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-// Run: forge test --match-path test/BiliquidVIPCard.t.sol -vvv
-
 import "forge-std/Test.sol";
-import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import "../src/BiliquidVIPCard.sol";
-import "../src/MockERC20.sol";
+import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
+// ─── Mock USDC ────────────────────────────────────────────────────────────────
+contract MockUSDC {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    function mint(address to, uint256 amount) external { balanceOf[to] += amount; }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        require(balanceOf[msg.sender] >= amount, "insufficient");
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to]         += amount;
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        require(balanceOf[from]             >= amount, "insufficient");
+        require(allowance[from][msg.sender] >= amount, "not allowed");
+        balanceOf[from]             -= amount;
+        balanceOf[to]               += amount;
+        allowance[from][msg.sender] -= amount;
+        return true;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+}
+
+// ─── Test Base ────────────────────────────────────────────────────────────────
 contract BiliquidVIPCardTest is Test {
+    BiliquidVIPCard public card;
+    MockUSDC        public usdc;
 
-    BiliquidVIPCard card; // points to the proxy, cast to impl interface
-    MockERC20       usdc;
+    address owner    = address(0xABCD);
+    address alice    = address(0x1);
+    address bob      = address(0x2);
+    address carol    = address(0x3);
+    address treasury_ = address(0xFEED);
 
-    // Chain: A(GeneralAgent) -> B(SuperNode) -> C(SuperNode) -> D(Node) -> E(Node) -> F(User)
-    address treasury = makeAddr("treasury");
-    address A        = makeAddr("A"); // GeneralAgent
-    address B        = makeAddr("B"); // SuperNode
-    address C        = makeAddr("C"); // SuperNode
-    address D        = makeAddr("D"); // Node
-    address E        = makeAddr("E"); // Node
-    address F        = makeAddr("F"); // User
-
-    uint256 constant GOLD_PRICE   = 30_000_000;  // 30 USDC (6 dec)
-    uint256 constant MINT_POINTS  = 10_000;
-    uint256 constant MERGE_POINTS = 4_000;       // Gold->Platinum
-
-    // Token ID constants — avoids vm.prank being consumed by card.GOLD() staticcall
-    uint8 constant GOLD_ID     = 1;
-    uint8 constant PLATINUM_ID = 2;
-    uint8 constant DIAMOND_ID  = 3;
-    uint8 constant BLACK_ID    = 4;
+    uint256 constant GOLD_MINT_PRICE   = 30_000_000;
+    uint256 constant PLAT_MINT_PRICE   = 120_000_000;
+    uint256 constant DIAM_MINT_PRICE   = 480_000_000;
+    uint256 constant BLACK_MINT_PRICE  = 1_920_000_000;
+    uint256 constant NON_MEMBER_AMOUNT = 100_000_000;
+    uint256 constant SECONDS_PER_MONTH = 30 * 86_400;
+    uint256 constant SECONDS_PER_DAY   = 86_400;
 
     function setUp() public {
-        usdc = new MockERC20("USD Coin", "USDC", 6);
+        usdc = new MockUSDC();
 
-        // Deploy implementation + UUPS proxy
+        vm.startPrank(owner);
         BiliquidVIPCard impl = new BiliquidVIPCard();
-        bytes memory initData = abi.encodeCall(BiliquidVIPCard.initialize, (address(usdc), treasury));
+        bytes memory initData = abi.encodeWithSelector(
+            BiliquidVIPCard.initialize.selector, address(usdc), treasury_
+        );
         ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
         card = BiliquidVIPCard(address(proxy));
+        vm.stopPrank();
 
-        // Roles (called as address(this) = owner)
-        card.setRole(A, 3); // GeneralAgent
-        card.setRole(B, 2); // SuperNode
-        card.setRole(C, 2); // SuperNode
-        card.setRole(D, 1); // Node
-        card.setRole(E, 1); // Node
+        usdc.mint(alice, 10_000_000_000);
+        usdc.mint(bob,   10_000_000_000);
+        usdc.mint(carol, 10_000_000_000);
 
-        // Build referral tree — each person must register BEFORE their downstream
-        vm.prank(A); card.register(address(0));   // A: root, depth=1
-        vm.prank(B); card.register(A);            // B: depth=2
-        vm.prank(C); card.register(B);            // C: depth=3
-        vm.prank(D); card.register(C);            // D: depth=4
-        vm.prank(E); card.register(D);            // E: depth=5
-        vm.prank(F); card.register(E);            // F: depth=6
-
-        // Fund F with 1200 USDC
-        usdc.mint(F, 1_200_000_000);
-        vm.prank(F);
-        usdc.approve(address(card), type(uint256).max);
+        vm.prank(alice); usdc.approve(address(card), type(uint256).max);
+        vm.prank(bob);   usdc.approve(address(card), type(uint256).max);
+        vm.prank(carol); usdc.approve(address(card), type(uint256).max);
     }
 
-    // ── Registration & Anti-Cycle Tests ───────────────────────────────────────
-
-    function test_Referral_Tree_Depths() public view {
-        assertEq(card.registrationDepth(A), 1, "A depth");
-        assertEq(card.registrationDepth(B), 2, "B depth");
-        assertEq(card.registrationDepth(C), 3, "C depth");
-        assertEq(card.registrationDepth(D), 4, "D depth");
-        assertEq(card.registrationDepth(E), 5, "E depth");
-        assertEq(card.registrationDepth(F), 6, "F depth");
+    function _fundContractForInterest() internal {
+        usdc.mint(address(card), 100_000_000_000);
     }
 
-    function test_Referral_Tree_Links() public view {
-        assertEq(card.referrerOf(F), E, "F->E");
-        assertEq(card.referrerOf(E), D, "E->D");
-        assertEq(card.referrerOf(D), C, "D->C");
-        assertEq(card.referrerOf(C), B, "C->B");
-        assertEq(card.referrerOf(B), A, "B->A");
-        assertEq(card.referrerOf(A), address(0), "A->none");
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  INITIALIZATION
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_init_tierConfigs() public view {
+        (uint256 mp, uint256 msa, uint256 apy, uint256 maxCount) = card.tierConfigs(1);
+        assertEq(mp,       30_000_000);
+        assertEq(msa,      30_000_000);
+        assertEq(apy,      900);
+        assertEq(maxCount, 100_000);
+
+        (mp, msa, apy, maxCount) = card.tierConfigs(4);
+        assertEq(mp,  1_920_000_000);
+        assertEq(apy, 1500);
     }
 
-    /// @dev Cycle impossible: A is already registered, can never re-register
-    function test_AntiCycle_AlreadyRegistered() public {
-        vm.prank(A);
-        vm.expectRevert("already registered");
-        card.register(F); // would create A->F (but A is already registered)
-    }
-
-    /// @dev Registering under an unregistered address is rejected
-    function test_AntiCycle_UnregisteredReferrer() public {
-        address stranger = makeAddr("stranger");
-        address newUser  = makeAddr("newUser");
-        vm.prank(newUser);
-        vm.expectRevert("referrer not registered");
-        card.register(stranger);
-    }
-
-    function test_AntiCycle_SelfRefer() public {
-        address newUser = makeAddr("newUser");
-        vm.prank(newUser);
-        vm.expectRevert("self-refer");
-        card.register(newUser);
-    }
-
-    function test_AntiCycle_RootRegister() public {
-        address newUser = makeAddr("newUser");
-        vm.prank(newUser);
-        card.register(address(0));
-        assertEq(card.registrationDepth(newUser), 1);
-        assertEq(card.referrerOf(newUser), address(0));
-    }
-
-    function test_AntiCycle_ChainTooDeep() public {
-        uint256 maxDepth = card.MAX_REFERRAL_DEPTH();
-        address prev = makeAddr("depth_root");
-        vm.prank(prev); card.register(address(0));
-
-        for (uint256 i = 1; i < maxDepth; i++) {
-            address next = address(uint160(uint256(keccak256(abi.encode("depth", i)))));
-            vm.prank(next); card.register(prev);
-            prev = next;
+    function test_init_validTerms() public view {
+        uint8[] memory terms = card.getValidTerms();
+        assertEq(terms.length, 3);
+        bool has3; bool has6; bool has12;
+        for (uint256 i = 0; i < terms.length; i++) {
+            if (terms[i] == 3)  has3  = true;
+            if (terms[i] == 6)  has6  = true;
+            if (terms[i] == 12) has12 = true;
         }
-        address tooDeep = makeAddr("tooDeep");
-        vm.prank(tooDeep);
-        vm.expectRevert("chain too deep");
-        card.register(prev);
+        assertTrue(has3 && has6 && has12);
+        assertEq(card.termMultiplierBps(3),  10500);
+        assertEq(card.termMultiplierBps(6),  11000);
+        assertEq(card.termMultiplierBps(12), 11500);
     }
 
-    // ── Mint Tests ────────────────────────────────────────────────────────────
-
-    function test_Mint_OneGold_NFTBalance() public {
-        vm.prank(F); card.mint(1);
-        assertEq(card.balanceOf(F, card.GOLD()), 1, "F gold");
+    function test_init_nonMemberConfig() public view {
+        (uint256 amount, uint256 baseApy, uint256 flexApy, bool flexEnabled) = card.nonMemberConfig();
+        assertEq(amount,  100_000_000);
+        assertEq(baseApy, 400);
+        assertEq(flexApy, 300);
+        assertFalse(flexEnabled);
     }
 
-    function test_Mint_OneGold_BuyerPoints() public {
-        vm.prank(F); card.mint(1);
-        assertEq(card.points(F), MINT_POINTS, "F pts");
+    function test_init_nextSerials() public view {
+        assertEq(card.nextSerial(1), 1);
+        assertEq(card.nextSerial(2), 1);
+        assertEq(card.nextSerial(3), 1);
+        assertEq(card.nextSerial(4), 1);
     }
 
-    function test_Mint_OneGold_ReferralPoints() public {
-        vm.prank(F); card.mint(1);
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  MINTING
+    // ═══════════════════════════════════════════════════════════════════════════
 
-        // E: direct(10%=1000) + nodeBoost(5%=500) = 1500
-        assertEq(card.points(E), 1_500, "E pts");
-        // D: indirect 5% = 500
-        assertEq(card.points(D), 500,   "D pts");
-        // C: superNode 5% = 500
-        assertEq(card.points(C), 500,   "C pts");
-        // B: same-level as C (both SuperNode) -> 0
-        assertEq(card.points(B), 0,     "B pts (same-level, no reward)");
-        // A: generalAgent 5% = 500
-        assertEq(card.points(A), 500,   "A pts");
+    function test_mintCard_gold() public {
+        vm.prank(alice);
+        card.mintCard(1, 1);
+
+        assertEq(usdc.balanceOf(alice), 10_000_000_000 - GOLD_MINT_PRICE);
+        assertEq(card.balanceOf(alice, 1), 1);
+        assertEq(card.nextSerial(1), 2);
+        assertEq(card.cardOwner(1, 1), alice);
+
+        uint256[] memory serials = card.getCardsByOwner(alice, 1);
+        assertEq(serials.length, 1);
+        assertEq(serials[0], 1);
     }
 
-    function test_Mint_OneGold_ReferralUsdc() public {
-        vm.prank(F); card.mint(1);
+    function test_mintCard_multipleCards() public {
+        vm.prank(alice);
+        card.mintCard(1, 3);
 
-        // E: 3 USDC (direct) + 1.5 USDC (nodeBoost) = 4.5 USDC
-        assertEq(usdc.balanceOf(E), 4_500_000, "E usdc");
-        // D: 1.5 USDC
-        assertEq(usdc.balanceOf(D), 1_500_000, "D usdc");
-        // C: 1.5 USDC
-        assertEq(usdc.balanceOf(C), 1_500_000, "C usdc");
-        // B: 0
-        assertEq(usdc.balanceOf(B), 0,         "B usdc");
-        // A: 1.5 USDC
-        assertEq(usdc.balanceOf(A), 1_500_000, "A usdc");
-        // Contract net: 30 - 9 = 21 USDC
-        assertEq(usdc.balanceOf(address(card)), 21_000_000, "contract net");
+        assertEq(card.balanceOf(alice, 1), 3);
+        assertEq(card.nextSerial(1), 4);
+        assertEq(card.getCardsByOwner(alice, 1).length, 3);
     }
 
-    function test_Mint_NoReferrer_RewardsToTreasury() public {
-        address G = makeAddr("G");
-        usdc.mint(G, 100_000_000);
-        vm.prank(G); usdc.approve(address(card), type(uint256).max);
-        vm.prank(G); card.register(address(0));
+    function test_mintCard_allTiers() public {
+        vm.startPrank(alice);
+        card.mintCard(1, 1);
+        card.mintCard(2, 1);
+        card.mintCard(3, 1);
+        card.mintCard(4, 1);
+        vm.stopPrank();
 
-        uint256 treasuryBefore = usdc.balanceOf(treasury);
-        vm.prank(G); card.mint(1);
-
-        assertEq(card.points(G), MINT_POINTS, "G pts");
-        assertEq(usdc.balanceOf(treasury), treasuryBefore, "treasury unchanged");
+        assertEq(card.balanceOf(alice, 1), 1);
+        assertEq(card.balanceOf(alice, 2), 1);
+        assertEq(card.balanceOf(alice, 3), 1);
+        assertEq(card.balanceOf(alice, 4), 1);
     }
 
-    // ── Merge Tests ───────────────────────────────────────────────────────────
-
-    function test_Merge_GoldToPlatinum_NFTState() public {
-        vm.prank(F); card.mint(4);
-        vm.prank(F); card.setApprovalForAll(address(card), true);
-        vm.prank(F); card.merge(PLATINUM_ID);
-
-        assertEq(card.balanceOf(F, GOLD_ID),     0, "F gold=0");
-        assertEq(card.balanceOf(F, PLATINUM_ID), 1, "F plat=1");
-        assertEq(card.balanceOf(treasury, GOLD_ID), 4, "treasury holds 4 Gold");
+    function test_mintCard_invalidTier_reverts() public {
+        vm.prank(alice);
+        vm.expectRevert("BiliquidVIPCard: invalid tier");
+        card.mintCard(5, 1);
     }
 
-    function test_Merge_GoldToPlatinum_MergerPoints() public {
-        vm.prank(F); card.mint(4);
-        uint256 ptsBefore = card.points(F);
-        vm.prank(F); card.setApprovalForAll(address(card), true);
-        vm.prank(F); card.merge(PLATINUM_ID);
-        assertEq(card.points(F), ptsBefore + MERGE_POINTS, "F merge pts");
+    function test_mintCard_zeroAmount_reverts() public {
+        vm.prank(alice);
+        vm.expectRevert("BiliquidVIPCard: amount=0");
+        card.mintCard(1, 0);
     }
 
-    function test_Merge_GoldToPlatinum_ReferralPoints() public {
-        vm.prank(F); card.mint(4);
-        vm.prank(F); card.setApprovalForAll(address(card), true);
+    function test_mintCard_serialsSequential_multiUser() public {
+        vm.prank(alice); card.mintCard(1, 2);
+        vm.prank(bob);   card.mintCard(1, 1);
 
-        uint256 eBefore = card.points(E);
-        uint256 dBefore = card.points(D);
-        uint256 cBefore = card.points(C);
-        uint256 bBefore = card.points(B);
-        uint256 aBefore = card.points(A);
-
-        vm.prank(F); card.merge(PLATINUM_ID);
-
-        // E: direct 10% + nodeBoost 5% = 400+200 = 600
-        assertEq(card.points(E) - eBefore, 600, "E merge pts");
-        // D: indirect 5% = 200
-        assertEq(card.points(D) - dBefore, 200, "D merge pts");
-        // C: superNode 5% = 200
-        assertEq(card.points(C) - cBefore, 200, "C merge pts");
-        // B: same-level -> 0
-        assertEq(card.points(B) - bBefore, 0,   "B merge pts (same-level)");
-        // A: generalAgent 5% = 200
-        assertEq(card.points(A) - aBefore, 200, "A merge pts");
+        assertEq(card.cardOwner(1, 1), alice);
+        assertEq(card.cardOwner(1, 2), alice);
+        assertEq(card.cardOwner(1, 3), bob);
+        assertEq(card.nextSerial(1), 4);
     }
 
-    function test_Merge_RevertIfInsufficientCards() public {
-        vm.prank(F); card.setApprovalForAll(address(card), true);
-        vm.expectRevert("insufficient cards");
-        vm.prank(F); card.merge(PLATINUM_ID);
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  GIFT POOL
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_adminMintToPool_and_giftCard() public {
+        vm.startPrank(owner);
+        card.adminMintToPool(2, 3);
+        assertEq(card.balanceOf(address(card), 2), 3);
+        assertEq(card.cardOwner(2, 1), address(card));
+
+        card.giftCard(2, 2, alice);
+        vm.stopPrank();
+
+        assertEq(card.cardOwner(2, 2), alice);
+        assertEq(card.balanceOf(alice, 2), 1);
+        assertEq(card.balanceOf(address(card), 2), 2);
     }
 
-    // ── Staking Tests ─────────────────────────────────────────────────────────
+    function test_giftCard_notInPool_reverts() public {
+        vm.prank(alice); card.mintCard(1, 1);
 
-    function test_Stake_LocksNFT() public {
-        vm.prank(F); card.mint(1);
-        vm.prank(F); card.setApprovalForAll(address(card), true);
-        vm.prank(F); card.stake(GOLD_ID, 1);
-
-        assertEq(card.balanceOf(F, GOLD_ID),     0, "free=0");
-        assertEq(card.stakedBalance(F, GOLD_ID), 1, "staked=1");
+        vm.prank(owner);
+        vm.expectRevert("BiliquidVIPCard: not in gift pool");
+        card.giftCard(1, 1, bob);
     }
 
-    function test_Unstake_ReturnsNFT() public {
-        vm.prank(F); card.mint(1);
-        vm.prank(F); card.setApprovalForAll(address(card), true);
-        vm.prank(F); card.stake(GOLD_ID, 1);
-        vm.prank(F); card.unstake(GOLD_ID, 1);
-
-        assertEq(card.balanceOf(F, GOLD_ID),     1, "restored");
-        assertEq(card.stakedBalance(F, GOLD_ID), 0, "staked=0");
-    }
-
-    function test_DailyInterest_Gold() public {
-        vm.prank(F); card.mint(1);
-        vm.prank(F); card.setApprovalForAll(address(card), true);
-        vm.prank(F); card.stake(GOLD_ID, 1);
-
-        uint256 expected = (uint256(30_000_000) * 900) / 10_000 / 365;
-        assertEq(card.dailyInterest(F), expected, "gold daily interest");
-    }
-
-    function test_DailyInterest_Platinum() public {
-        vm.prank(F); card.mint(4);
-        vm.prank(F); card.setApprovalForAll(address(card), true);
-        vm.prank(F); card.merge(PLATINUM_ID);
-        vm.prank(F); card.stake(PLATINUM_ID, 1);
-
-        uint256 expected = (uint256(120_000_000) * 1000) / 10_000 / 365;
-        assertEq(card.dailyInterest(F), expected, "platinum daily interest");
-    }
-
-    // ── getUserState Tests ────────────────────────────────────────────────────
-
-    function test_GetUserState_Snapshot() public {
-        vm.prank(F); card.mint(1);
-
-        (
-            uint256 pts,
-            uint256 fGold, uint256 fPlat, uint256 fDia, uint256 fBlack,
-            uint256 sGold, uint256 sPlat, uint256 sDia, uint256 sBlack,
-            address referrer,
-            uint8   role
-        ) = card.getUserState(F);
-
-        assertEq(pts,      MINT_POINTS, "pts");
-        assertEq(fGold,    1,           "freeGold");
-        assertEq(fPlat,    0,           "freePlat");
-        assertEq(fDia,     0,           "freeDia");
-        assertEq(fBlack,   0,           "freeBlack");
-        assertEq(sGold,    0,           "stakedGold");
-        assertEq(sPlat,    0,           "stakedPlat");
-        assertEq(sDia,     0,           "stakedDia");
-        assertEq(sBlack,   0,           "stakedBlack");
-        assertEq(referrer, E,           "referrer");
-        assertEq(role,     0,           "role=User");
-    }
-
-    // ── Full Scenario Test ────────────────────────────────────────────────────
-
-    function test_FullScenario_FourMintsAndMerge() public {
-        vm.prank(F); card.mint(4);
-
-        assertEq(card.points(F), MINT_POINTS * 4,   "F pts after 4 mints");
-        assertEq(card.points(E), 1_500 * 4,         "E pts after 4 mints");
-        assertEq(card.points(D), 500 * 4,           "D pts after 4 mints");
-        assertEq(card.points(C), 500 * 4,           "C pts after 4 mints");
-        assertEq(card.points(B), 0,                 "B pts always 0");
-        assertEq(card.points(A), 500 * 4,           "A pts after 4 mints");
-
-        assertEq(usdc.balanceOf(E), 4_500_000 * 4,  "E usdc after 4 mints");
-        assertEq(usdc.balanceOf(D), 1_500_000 * 4,  "D usdc after 4 mints");
-        assertEq(usdc.balanceOf(C), 1_500_000 * 4,  "C usdc after 4 mints");
-        assertEq(usdc.balanceOf(B), 0,              "B usdc always 0");
-        assertEq(usdc.balanceOf(A), 1_500_000 * 4,  "A usdc after 4 mints");
-
-        vm.prank(F); card.setApprovalForAll(address(card), true);
-        vm.prank(F); card.merge(PLATINUM_ID);
-
-        assertEq(card.points(F), MINT_POINTS * 4 + MERGE_POINTS, "F total pts");
-        assertEq(card.points(E), 1_500 * 4 + 600,                "E total pts");
-        assertEq(card.points(D), 500 * 4 + 200,                  "D total pts");
-        assertEq(card.points(C), 500 * 4 + 200,                  "C total pts");
-        assertEq(card.points(B), 0,                               "B total pts");
-        assertEq(card.points(A), 500 * 4 + 200,                  "A total pts");
-
-        // Contract holds: 120 paid - 36 distributed = 84 USDC
-        assertEq(usdc.balanceOf(address(card)), 84_000_000, "contract net usdc");
-    }
-
-    // ── Upgrade Tests ─────────────────────────────────────────────────────────
-
-    function test_Upgrade_OnlyOwner() public {
-        BiliquidVIPCard impl2 = new BiliquidVIPCard();
-        vm.prank(F);
+    function test_adminMintToPool_onlyOwner() public {
+        vm.prank(alice);
         vm.expectRevert();
-        card.upgradeToAndCall(address(impl2), "");
+        card.adminMintToPool(1, 1);
     }
 
-    function test_Upgrade_OwnerCanUpgrade() public {
-        // Deploy new impl and upgrade — state should persist
-        vm.prank(F); card.mint(1);
-        assertEq(card.balanceOf(F, GOLD_ID), 1, "before upgrade");
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  CARD TRANSFER
+    // ═══════════════════════════════════════════════════════════════════════════
 
-        BiliquidVIPCard impl2 = new BiliquidVIPCard();
-        // address(this) is the owner (setUp deployer)
-        card.upgradeToAndCall(address(impl2), "");
+    function test_transferCard() public {
+        vm.prank(alice); card.mintCard(1, 2); // serials 1, 2
 
-        // State preserved across upgrade
-        assertEq(card.balanceOf(F, GOLD_ID), 1, "after upgrade");
+        vm.prank(alice); card.transferCard(1, 1, bob);
+
+        assertEq(card.cardOwner(1, 1), bob);
+        assertEq(card.balanceOf(alice, 1), 1);
+        assertEq(card.balanceOf(bob, 1), 1);
+
+        uint256[] memory aliceSerials = card.getCardsByOwner(alice, 1);
+        assertEq(aliceSerials.length, 1);
+
+        uint256[] memory bobSerials = card.getCardsByOwner(bob, 1);
+        assertEq(bobSerials.length, 1);
+        assertEq(bobSerials[0], 1);
+    }
+
+    function test_transferCard_swapAndPop_integrity() public {
+        vm.prank(alice); card.mintCard(1, 3); // serials 1, 2, 3
+
+        vm.prank(alice); card.transferCard(1, 2, bob); // remove middle
+
+        uint256[] memory serials = card.getCardsByOwner(alice, 1);
+        assertEq(serials.length, 2);
+        assertEq(card.cardOwner(1, 1), alice);
+        assertEq(card.cardOwner(1, 3), alice);
+        assertEq(card.cardOwner(1, 2), bob);
+    }
+
+    function test_transferCard_notOwner_reverts() public {
+        vm.prank(alice); card.mintCard(1, 1);
+
+        vm.prank(bob);
+        vm.expectRevert("BiliquidVIPCard: not owner");
+        card.transferCard(1, 1, carol);
+    }
+
+    function test_transferCard_stakedCard_reverts() public {
+        _fundContractForInterest();
+        vm.prank(alice); card.mintCard(1, 1);
+        vm.prank(alice); card.stakeCard(1, 1, 3);
+
+        vm.prank(alice);
+        vm.expectRevert("BiliquidVIPCard: card is staked");
+        card.transferCard(1, 1, bob);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  MEMBER STAKING
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_stakeCard_3month() public {
+        _fundContractForInterest();
+        vm.prank(alice); card.mintCard(1, 1);
+
+        uint256 aliceBefore = usdc.balanceOf(alice);
+
+        vm.prank(alice);
+        uint256 stakeId = card.stakeCard(1, 1, 3);
+
+        assertEq(stakeId, 0);
+        assertEq(usdc.balanceOf(alice), aliceBefore - GOLD_MINT_PRICE);
+        assertTrue(card.cardStaked(1, 1));
+        assertEq(card.totalStakedByTier(1), 1);
+
+        BiliquidVIPCard.StakeRecord[] memory records = card.getStakeRecords(alice);
+        assertEq(records.length, 1);
+        assertTrue(records[0].isMember);
+        assertEq(records[0].tier, 1);
+        assertEq(records[0].cardSerial, 1);
+        assertFalse(records[0].isFlexible);
+        assertEq(records[0].termMonths, 3);
+        assertEq(records[0].usdcAmount, GOLD_MINT_PRICE);
+        assertTrue(records[0].active);
+        // Gold 9% * 105% = 945 bps
+        assertEq(records[0].snapshotApyBps, 900 * 10500 / 10000);
+    }
+
+    function test_stakeCard_activePositionTracking() public {
+        _fundContractForInterest();
+        vm.prank(alice); card.mintCard(1, 1);
+        vm.prank(alice); card.stakeCard(1, 1, 3);
+
+        (uint256 sid, bool hasPos) = card.getActivePositionByCard(1, 1);
+        assertTrue(hasPos);
+        assertEq(sid, 0);
+    }
+
+    function test_stakeCard_doubleStake_reverts() public {
+        vm.prank(alice); card.mintCard(1, 1);
+        vm.prank(alice); card.stakeCard(1, 1, 3);
+
+        vm.prank(alice);
+        vm.expectRevert("BiliquidVIPCard: card already staked");
+        card.stakeCard(1, 1, 6);
+    }
+
+    function test_stakeCard_invalidTerm_reverts() public {
+        vm.prank(alice); card.mintCard(1, 1);
+
+        vm.prank(alice);
+        vm.expectRevert("BiliquidVIPCard: invalid term");
+        card.stakeCard(1, 1, 9);
+    }
+
+    function test_stakeCard_notOwner_reverts() public {
+        vm.prank(alice); card.mintCard(1, 1);
+
+        vm.prank(bob);
+        vm.expectRevert("BiliquidVIPCard: not card owner");
+        card.stakeCard(1, 1, 3);
+    }
+
+    function test_stakeCard_flexible_disabled_reverts() public {
+        vm.prank(alice); card.mintCard(1, 1);
+
+        vm.prank(alice);
+        vm.expectRevert("BiliquidVIPCard: flexible staking disabled");
+        card.stakeCard(1, 1, 0);
+    }
+
+    function test_stakeCard_flexible_enabled() public {
+        _fundContractForInterest();
+        vm.prank(owner); card.setMemberFlexibleStaking(true, 600);
+
+        vm.prank(alice); card.mintCard(1, 1);
+        vm.prank(alice); card.stakeCard(1, 1, 0);
+
+        BiliquidVIPCard.StakeRecord[] memory records = card.getStakeRecords(alice);
+        assertTrue(records[0].isFlexible);
+        assertEq(records[0].snapshotApyBps, 600);
+        assertEq(records[0].unlockedAt, records[0].stakedAt);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  NON-MEMBER STAKING
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_stakeNonMember_3month() public {
+        _fundContractForInterest();
+        uint256 bobBefore = usdc.balanceOf(bob);
+
+        vm.prank(bob); card.stakeNonMember(3);
+
+        assertEq(usdc.balanceOf(bob), bobBefore - NON_MEMBER_AMOUNT);
+
+        BiliquidVIPCard.StakeRecord[] memory records = card.getStakeRecords(bob);
+        assertEq(records.length, 1);
+        assertFalse(records[0].isMember);
+        assertEq(records[0].usdcAmount, NON_MEMBER_AMOUNT);
+        // 4% * 105% = 420 bps
+        assertEq(records[0].snapshotApyBps, 400 * 10500 / 10000);
+        assertFalse(records[0].isFlexible);
+        assertEq(records[0].termMonths, 3);
+    }
+
+    function test_stakeNonMember_flexible_enabled() public {
+        _fundContractForInterest();
+        vm.prank(owner); card.setNonMemberConfig(100_000_000, 400, 300, true);
+
+        vm.prank(bob); card.stakeNonMember(0);
+
+        BiliquidVIPCard.StakeRecord[] memory records = card.getStakeRecords(bob);
+        assertTrue(records[0].isFlexible);
+        assertEq(records[0].snapshotApyBps, 300);
+    }
+
+    function test_stakeNonMember_flexible_disabled_reverts() public {
+        vm.prank(bob);
+        vm.expectRevert("BiliquidVIPCard: non-member flexible disabled");
+        card.stakeNonMember(0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  INTEREST CALCULATIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_dailyInterest_gold_3month() public {
+        _fundContractForInterest();
+        vm.prank(alice); card.mintCard(1, 1);
+        vm.prank(alice); card.stakeCard(1, 1, 3);
+
+        // Gold 9% * 105% = 945 bps
+        uint256 expected = uint256(30_000_000) * 945 / (uint256(10_000) * 365);
+        assertEq(card.dailyInterestFor(alice, 0), expected);
+    }
+
+    function test_pendingInterest_after30days() public {
+        _fundContractForInterest();
+        vm.prank(alice); card.mintCard(1, 1);
+        vm.prank(alice); card.stakeCard(1, 1, 3);
+
+        vm.warp(block.timestamp + 30 * SECONDS_PER_DAY);
+
+        uint256 pending = card.pendingInterest(alice, 0);
+        uint256 daily   = card.dailyInterestFor(alice, 0);
+        assertEq(pending, daily * 30);
+    }
+
+    function test_pendingInterest_15days_is_zero() public {
+        _fundContractForInterest();
+        vm.prank(alice); card.mintCard(1, 1);
+        vm.prank(alice); card.stakeCard(1, 1, 3);
+
+        vm.warp(block.timestamp + 15 * SECONDS_PER_DAY);
+
+        assertEq(card.pendingInterest(alice, 0), 0); // not yet claimable
+        assertGt(card.pendingInterestExact(alice, 0), 0); // but accruing
+    }
+
+    function test_claimInterest_after30days() public {
+        _fundContractForInterest();
+        vm.prank(alice); card.mintCard(1, 1);
+        vm.prank(alice); card.stakeCard(1, 1, 3);
+
+        vm.warp(block.timestamp + 31 * SECONDS_PER_DAY);
+
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        vm.prank(alice); card.claimInterest(0);
+
+        uint256 daily = uint256(30_000_000) * 945 / (uint256(10_000) * 365);
+        assertEq(usdc.balanceOf(alice), aliceBefore + daily * 30);
+    }
+
+    function test_claimInterest_twice_in_60days() public {
+        _fundContractForInterest();
+        vm.prank(alice); card.mintCard(1, 1);
+        vm.prank(alice); card.stakeCard(1, 1, 12);
+
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        uint256 daily = card.dailyInterestFor(alice, 0);
+
+        vm.warp(block.timestamp + 30 * SECONDS_PER_DAY);
+        vm.prank(alice); card.claimInterest(0);
+        assertEq(usdc.balanceOf(alice), aliceBefore + daily * 30);
+
+        vm.warp(block.timestamp + 30 * SECONDS_PER_DAY);
+        vm.prank(alice); card.claimInterest(0);
+        assertEq(usdc.balanceOf(alice), aliceBefore + daily * 60);
+    }
+
+    function test_claimInterest_tooEarly_reverts() public {
+        _fundContractForInterest();
+        vm.prank(alice); card.mintCard(1, 1);
+        vm.prank(alice); card.stakeCard(1, 1, 3);
+
+        vm.warp(block.timestamp + 29 * SECONDS_PER_DAY);
+        vm.prank(alice);
+        vm.expectRevert("BiliquidVIPCard: claim once per 30 days");
+        card.claimInterest(0);
+    }
+
+    function test_claimAllInterest_multiplePositions() public {
+        _fundContractForInterest();
+        vm.prank(owner); card.setNonMemberConfig(100_000_000, 400, 300, true);
+
+        vm.prank(alice); card.mintCard(1, 1);
+        vm.prank(alice); card.stakeCard(1, 1, 3);     // position 0 (member)
+        vm.prank(alice); card.stakeNonMember(3);      // position 1 (non-member)
+
+        vm.warp(block.timestamp + 31 * SECONDS_PER_DAY);
+        uint256 aliceBefore = usdc.balanceOf(alice);
+
+        vm.prank(alice); card.claimAllInterest();
+
+        uint256 memberDaily = card.dailyInterestFor(alice, 0);
+        uint256 nmApyBps    = 400 * 10500 / 10000; // 420 bps
+        uint256 nmDaily     = 100_000_000 * nmApyBps / (10_000 * 365);
+        assertEq(usdc.balanceOf(alice), aliceBefore + (memberDaily + nmDaily) * 30);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  UNSTAKE
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_unstake_fixedTerm_afterMaturity() public {
+        _fundContractForInterest();
+        vm.prank(alice); card.mintCard(1, 1);
+        vm.prank(alice); card.stakeCard(1, 1, 3);
+
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        uint256 daily       = card.dailyInterestFor(alice, 0);
+
+        vm.warp(block.timestamp + 3 * SECONDS_PER_MONTH + 1);
+        vm.prank(alice); card.unstake(0);
+
+        // Principal + 3 months (90 days) interest
+        assertEq(usdc.balanceOf(alice), aliceBefore + GOLD_MINT_PRICE + daily * 90);
+        assertFalse(card.cardStaked(1, 1));
+        assertEq(card.totalStakedByTier(1), 0);
+
+        (,bool hasPos) = card.getActivePositionByCard(1, 1);
+        assertFalse(hasPos);
+
+        assertFalse(card.getStakeRecords(alice)[0].active);
+    }
+
+    function test_unstake_fixedTerm_beforeMaturity_reverts() public {
+        vm.prank(alice); card.mintCard(1, 1);
+        vm.prank(alice); card.stakeCard(1, 1, 3);
+
+        vm.warp(block.timestamp + 89 * SECONDS_PER_DAY);
+
+        vm.prank(alice);
+        vm.expectRevert("BiliquidVIPCard: still locked");
+        card.unstake(0);
+    }
+
+    function test_unstake_flexible_anytime() public {
+        _fundContractForInterest();
+        vm.prank(owner); card.setMemberFlexibleStaking(true, 600);
+
+        vm.prank(alice); card.mintCard(1, 1);
+        vm.prank(alice); card.stakeCard(1, 1, 0);
+
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        vm.warp(block.timestamp + 5 * SECONDS_PER_DAY); // no lock
+
+        vm.prank(alice); card.unstake(0);
+        assertEq(usdc.balanceOf(alice), aliceBefore + GOLD_MINT_PRICE); // no interest (< 30 days)
+    }
+
+    function test_unstake_forfeits_partial_month_interest() public {
+        _fundContractForInterest();
+        vm.prank(alice); card.mintCard(1, 1);
+        vm.prank(alice); card.stakeCard(1, 1, 3);
+
+        uint256 daily = card.dailyInterestFor(alice, 0);
+        vm.warp(block.timestamp + 3 * SECONDS_PER_MONTH + 15 * SECONDS_PER_DAY);
+
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        vm.prank(alice); card.unstake(0);
+
+        // Only 3 whole months (90 days); partial 15 days forfeited
+        assertEq(usdc.balanceOf(alice), aliceBefore + GOLD_MINT_PRICE + daily * 90);
+    }
+
+    function test_unstake_nonMember() public {
+        _fundContractForInterest();
+        vm.prank(bob); card.stakeNonMember(6);
+
+        uint256 bobBefore = usdc.balanceOf(bob);
+        uint256 daily     = card.dailyInterestFor(bob, 0);
+
+        vm.warp(block.timestamp + 6 * SECONDS_PER_MONTH);
+        vm.prank(bob); card.unstake(0);
+
+        assertEq(usdc.balanceOf(bob), bobBefore + NON_MEMBER_AMOUNT + daily * 180);
+    }
+
+    function test_unstake_thenRestake_sameCard() public {
+        _fundContractForInterest();
+        vm.prank(alice); card.mintCard(1, 1);
+        vm.prank(alice); card.stakeCard(1, 1, 3);
+
+        vm.warp(block.timestamp + 3 * SECONDS_PER_MONTH);
+        vm.prank(alice); card.unstake(0);
+
+        // Re-stake same card
+        vm.prank(alice);
+        uint256 stakeId2 = card.stakeCard(1, 1, 6);
+        assertEq(stakeId2, 1);
+        assertTrue(card.cardStaked(1, 1));
+    }
+
+    function test_unstake_inactive_reverts() public {
+        _fundContractForInterest();
+        vm.prank(alice); card.mintCard(1, 1);
+        vm.prank(alice); card.stakeCard(1, 1, 3);
+
+        vm.warp(block.timestamp + 3 * SECONDS_PER_MONTH);
+        vm.prank(alice); card.unstake(0);
+
+        vm.prank(alice);
+        vm.expectRevert("BiliquidVIPCard: position not active");
+        card.unstake(0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  APY SNAPSHOT ISOLATION
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_snapshotApy_unchangedByAdminUpdate() public {
+        _fundContractForInterest();
+        vm.prank(alice); card.mintCard(1, 1);
+        vm.prank(alice); card.stakeCard(1, 1, 3);
+
+        uint256 originalApy = card.getStakeRecords(alice)[0].snapshotApyBps;
+
+        vm.prank(owner); card.setTierConfig(1, 30_000_000, 30_000_000, 1500, 100_000);
+
+        assertEq(card.getStakeRecords(alice)[0].snapshotApyBps, originalApy);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  GLOBAL STAKE CAP
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_globalStakeCap() public {
+        // Set cap to 2 for gold to keep test cheap
+        vm.prank(owner); card.setTierConfig(1, 30_000_000, 30_000_000, 900, 2);
+        _fundContractForInterest();
+
+        vm.prank(alice); card.mintCard(1, 1);
+        vm.prank(bob);   card.mintCard(1, 1);
+        vm.prank(carol); card.mintCard(1, 1);
+
+        vm.prank(alice); card.stakeCard(1, 1, 3); // count = 1
+        vm.prank(bob);   card.stakeCard(1, 2, 3); // count = 2
+
+        vm.prank(carol);
+        vm.expectRevert("BiliquidVIPCard: tier stake cap reached");
+        card.stakeCard(1, 3, 3);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  USER STATE VIEW
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_getUserState() public {
+        _fundContractForInterest();
+        vm.prank(alice); card.mintCard(1, 2);
+        vm.prank(alice); card.mintCard(2, 1);
+        vm.prank(alice); card.stakeCard(1, 1, 3);
+
+        (uint256 gc, uint256 pc, uint256 dc, uint256 bc,
+         uint256 gs, uint256 ps, uint256 ds, uint256 bs,
+         address ref, uint8 role) = card.getUserState(alice);
+
+        assertEq(gc, 2);  // 2 gold cards
+        assertEq(pc, 1);  // 1 platinum card
+        assertEq(dc, 0);
+        assertEq(bc, 0);
+        assertEq(gs, 1);  // 1 gold staked
+        assertEq(ps, 0);
+        assertEq(ds, 0);
+        assertEq(bs, 0);
+        assertEq(ref, address(0));
+        assertEq(role, 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  REGISTRATION & REFERRAL
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_register_noReferrer() public {
+        vm.prank(alice); card.register(address(0));
+        assertEq(card.registrationDepth(alice), 1);
+        assertEq(card.referrerOf(alice), address(0));
+    }
+
+    function test_register_withReferrer() public {
+        vm.prank(alice); card.register(address(0));
+        vm.prank(bob);   card.register(alice);
+
+        assertEq(card.registrationDepth(bob), 2);
+        assertEq(card.referrerOf(bob), alice);
+    }
+
+    function test_register_twice_reverts() public {
+        vm.prank(alice); card.register(address(0));
+        vm.prank(alice);
+        vm.expectRevert("BiliquidVIPCard: already registered");
+        card.register(address(0));
+    }
+
+    function test_referral_directReward() public {
+        vm.prank(alice); card.register(address(0));
+        vm.prank(bob);   card.register(alice);
+
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        vm.prank(bob); card.mintCard(1, 1); // 30 USDC mint
+
+        // direct: 10% of 30 USDC = 3 USDC
+        assertEq(usdc.balanceOf(alice), aliceBefore + 3_000_000);
+    }
+
+    function test_referral_indirectReward() public {
+        vm.prank(alice); card.register(address(0));
+        vm.prank(bob);   card.register(alice);
+        vm.prank(carol); card.register(bob);
+
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        uint256 bobBefore   = usdc.balanceOf(bob);
+
+        vm.prank(carol); card.mintCard(1, 1); // 30 USDC
+
+        assertEq(usdc.balanceOf(bob),   bobBefore   + 3_000_000); // direct 10%
+        assertEq(usdc.balanceOf(alice), aliceBefore + 1_500_000); // indirect 5%
+    }
+
+    function test_referral_nodeBoost() public {
+        vm.prank(alice); card.register(address(0));
+        vm.prank(owner); card.setRole(alice, 1); // ROLE_NODE
+        vm.prank(bob);   card.register(alice);
+
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        vm.prank(bob); card.mintCard(1, 1); // 30 USDC
+
+        // direct 10% + node_boost 5% = 15% of 30 = 4.5 USDC
+        assertEq(usdc.balanceOf(alice), aliceBefore + 4_500_000);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  ADMIN FUNCTIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_setTierConfig() public {
+        vm.prank(owner); card.setTierConfig(1, 50_000_000, 50_000_000, 1000, 50_000);
+        (uint256 mp,,,) = card.tierConfigs(1);
+        assertEq(mp, 50_000_000);
+    }
+
+    function test_addTerm_and_useIt() public {
+        _fundContractForInterest();
+        vm.prank(owner); card.addTerm(24, 12500);
+
+        vm.prank(alice); card.mintCard(1, 1);
+        vm.prank(alice); card.stakeCard(1, 1, 24);
+
+        // Gold 9% * 125% = 1125 bps
+        assertEq(card.getStakeRecords(alice)[0].snapshotApyBps, 900 * 12500 / 10000);
+    }
+
+    function test_removeTerm() public {
+        vm.prank(owner); card.removeTerm(6);
+
+        vm.prank(alice); card.mintCard(1, 1);
+        vm.prank(alice);
+        vm.expectRevert("BiliquidVIPCard: invalid term");
+        card.stakeCard(1, 1, 6);
+    }
+
+    function test_setPaused() public {
+        vm.prank(owner); card.setPaused(true);
+
+        vm.prank(alice);
+        vm.expectRevert("BiliquidVIPCard: paused");
+        card.mintCard(1, 1);
+    }
+
+    function test_withdrawToTreasury() public {
+        usdc.mint(address(card), 1_000_000);
+        vm.prank(owner); card.withdrawToTreasury(address(usdc), 1_000_000);
+        assertEq(usdc.balanceOf(treasury_), 1_000_000);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  ERC-1155 STANDARD
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_supportsInterface() public view {
+        assertTrue(card.supportsInterface(0xd9b67a26));
+        assertTrue(card.supportsInterface(0x01ffc9a7));
+    }
+
+    function test_balanceOfBatch() public {
+        vm.prank(alice); card.mintCard(1, 2);
+        vm.prank(alice); card.mintCard(2, 1);
+
+        address[] memory accounts = new address[](2);
+        uint256[] memory ids      = new uint256[](2);
+        accounts[0] = alice; ids[0] = 1;
+        accounts[1] = alice; ids[1] = 2;
+
+        uint256[] memory bals = card.balanceOfBatch(accounts, ids);
+        assertEq(bals[0], 2);
+        assertEq(bals[1], 1);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  EDGE CASES & MULTI-POSITION
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_multiplePositions_sameWallet() public {
+        _fundContractForInterest();
+        vm.prank(alice); card.mintCard(1, 3);
+
+        vm.startPrank(alice);
+        card.stakeCard(1, 1, 3);
+        card.stakeCard(1, 2, 6);
+        card.stakeCard(1, 3, 12);
+        card.stakeNonMember(3);
+        vm.stopPrank();
+
+        assertEq(card.getStakeRecords(alice).length, 4);
+        assertEq(card.totalStakedByTier(1), 3);
+    }
+
+    function test_pendingInterest_inactivePosition_zero() public {
+        _fundContractForInterest();
+        vm.prank(alice); card.mintCard(1, 1);
+        vm.prank(alice); card.stakeCard(1, 1, 3);
+
+        vm.warp(block.timestamp + 3 * SECONDS_PER_MONTH);
+        vm.prank(alice); card.unstake(0);
+
+        assertEq(card.pendingInterest(alice, 0), 0);
+        assertEq(card.pendingInterestExact(alice, 0), 0);
+    }
+
+    function test_getActivePositionByCard_afterUnstake() public {
+        _fundContractForInterest();
+        vm.prank(alice); card.mintCard(1, 1);
+        vm.prank(alice); card.stakeCard(1, 1, 3);
+
+        vm.warp(block.timestamp + 3 * SECONDS_PER_MONTH);
+        vm.prank(alice); card.unstake(0);
+
+        (,bool hasPos) = card.getActivePositionByCard(1, 1);
+        assertFalse(hasPos);
+    }
+
+    function test_claimAllInterest_skipsInactive() public {
+        _fundContractForInterest();
+        vm.prank(alice); card.mintCard(1, 2);
+
+        vm.startPrank(alice);
+        card.stakeCard(1, 1, 3);
+        card.stakeCard(1, 2, 3);
+        vm.stopPrank();
+
+        vm.warp(block.timestamp + 3 * SECONDS_PER_MONTH);
+        vm.prank(alice); card.unstake(0); // unstake position 0
+
+        // Advance time; claimAllInterest should work (only position 1 is active)
+        vm.warp(block.timestamp + 30 * SECONDS_PER_DAY);
+        vm.prank(alice); card.claimAllInterest(); // must not revert
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  INTEREST MATH PRECISION
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_interest_gold_12month_fullCycle() public {
+        _fundContractForInterest();
+        vm.prank(alice); card.mintCard(1, 1);
+        vm.prank(alice); card.stakeCard(1, 1, 12);
+
+        // Gold 9% * 115% = 1035 bps
+        uint256 daily = card.dailyInterestFor(alice, 0);
+        assertEq(daily, uint256(30_000_000) * 1035 / (uint256(10_000) * 365));
+
+        vm.warp(block.timestamp + 360 * SECONDS_PER_DAY + 1);
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        vm.prank(alice); card.unstake(0);
+
+        assertEq(usdc.balanceOf(alice), aliceBefore + GOLD_MINT_PRICE + daily * 360);
+    }
+
+    function test_interest_nonMember_12month() public {
+        _fundContractForInterest();
+        vm.prank(bob); card.stakeNonMember(12);
+
+        // 4% * 115% = 460 bps
+        uint256 daily = card.dailyInterestFor(bob, 0);
+        assertEq(daily, uint256(100_000_000) * 460 / (uint256(10_000) * 365));
+
+        vm.warp(block.timestamp + 360 * SECONDS_PER_DAY + 1);
+        uint256 bobBefore = usdc.balanceOf(bob);
+        vm.prank(bob); card.unstake(0);
+
+        assertEq(usdc.balanceOf(bob), bobBefore + NON_MEMBER_AMOUNT + daily * 360);
     }
 }
