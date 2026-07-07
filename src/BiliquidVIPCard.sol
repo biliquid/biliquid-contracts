@@ -2,39 +2,22 @@
 pragma solidity ^0.8.24;
 
 /**
- * @title  BiliquidVIPCard v3
- * @notice ERC-1155 VIP membership card protocol with per-card serial tracking
- *         and a dual staking model (member + non-member).
+ * @title  BiliquidVIPCard
+ * @notice ERC-1155 VIP membership card — one-card-one-position staking model.
  *
- * ── Card Model ────────────────────────────────────────────────────────────────
- *   4 tiers: Gold(1), Platinum(2), Diamond(3), Black(4)
- *   Each card has a unique identity: (tier, serialNumber).
- *   Serials are sequential per tier, starting at 1; never reused.
- *   All tiers are directly purchasable. No merge mechanism.
+ * ── Member Staking ────────────────────────────────────────────────────────────
+ *   lockCard → openPosition (ONE per card) → addToPosition / partialWithdraw /
+ *              upgradeTerms / claimMemberInterest → closePosition → unlockCard
  *
- * ── Member Staking (two-step, v3) ────────────────────────────────────────────
- *   Step 1 — lockCard(tier, serial, termMonths):
- *     Lock the card for a term. No USDC required.
- *     StakeRecord is created with usdcAmount = 0, lastClaimAt = 0.
- *   Step 2 — depositUsdc(stakeId, amount):
- *     Deposit 1 .. maxStakeAmountUsdc USDC. APY accrual starts at deposit time.
- *     Card must already be locked (active member position with usdcAmount == 0).
- *   - APY = tier.apyBps x termMultiplierBps / 10_000 (snapshotted at lock time).
- *   - Flexible: memberFlexibleApyBps used directly, no multiplier.
- *   - One active position per card. Must unstake before re-staking same card.
+ * ── Interest ─────────────────────────────────────────────────────────────────
+ *   Member:     continuous accrual  — principal * apyBps * elapsed / (10000 * 365d)
+ *   Non-member: monthly accrual     — _claimInterestLegacy (30-day buckets)
  *
- * ── Non-Member Staking ────────────────────────────────────────────────────────
- *   - No card required. Fixed USDC amount (nonMemberConfig.stakeAmountUsdc).
- *   - APY = nonMemberConfig.baseApyBps x termMultiplierBps / 10_000.
- *   - Flexible: nonMemberConfig.flexibleApyBps.
- *
- * ── Claim Rule (all positions) ────────────────────────────────────────────────
- *   - Interest accrues daily. Claim allowed only every 30 days.
- *   - Sub-30-day interest is permanently forfeited on unstake.
- *   - Member positions without deposited USDC (usdcAmount == 0) earn no interest.
+ * ── Card Synthesis ────────────────────────────────────────────────────────────
+ *   Gold×4 → Platinum, Platinum×4 → Diamond, Diamond×4 → Black (no USDC cost)
  *
  * ── Upgradeability ────────────────────────────────────────────────────────────
- *   UUPS proxy (EIP-1822). Only owner may authorise upgrades.
+ *   UUPS proxy. This is a FRESH DEPLOY — no legacy storage compatibility needed.
  */
 
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
@@ -47,21 +30,18 @@ interface IERC20 {
     function balanceOf(address account) external view returns (uint256);
 }
 
-contract BiliquidVIPCard is
-    Initializable,
-    OwnableUpgradeable,
-    UUPSUpgradeable
-{
-    // ─── Reentrancy guard (inline, upgradeable-safe) ───────────────────────────
-    uint256 private _reentrancyStatus; // 0 = unset, 1 = not entered, 2 = entered
+contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
+
+    // ─── Reentrancy guard ─────────────────────────────────────────────────────
+    uint256 private _reentrancyStatus;
     modifier nonReentrant() {
-        require(_reentrancyStatus != 2, "BiliquidVIPCard: reentrant call");
+        if (_reentrancyStatus == 2) revert Reentrant();
         _reentrancyStatus = 2;
         _;
         _reentrancyStatus = 1;
     }
+
     // ─── ERC-1155 storage ─────────────────────────────────────────────────────
-    // Balances include both free and staked cards.
     mapping(address => mapping(uint256 => uint256)) private _balances;
     mapping(address => mapping(address => bool))    private _operatorApprovals;
     string public uri;
@@ -94,56 +74,45 @@ contract BiliquidVIPCard is
 
     // ─── Tier config ──────────────────────────────────────────────────────────
     struct TierConfig {
-        uint256 mintPrice;          // USDC price per card (6 decimals)
-        uint256 maxStakeAmountUsdc; // USDC principal per member stake (6 dec)
-        uint256 apyBps;             // base APY in bps (e.g. 900 = 9%)
-        uint256 maxStakeCount;      // global cap: max simultaneously staked cards
+        uint256 mintPrice;
+        uint256 maxStakeAmountUsdc;
+        uint256 apyBps;
+        uint256 mintCap;
     }
     mapping(uint8 => TierConfig) public tierConfigs;
 
     // ─── Non-member config ────────────────────────────────────────────────────
     struct NonMemberConfig {
-        uint256 stakeAmountUsdc;  // fixed principal (6 dec)
-        uint256 baseApyBps;       // base APY for fixed-term positions
-        uint256 flexibleApyBps;   // APY for flexible positions
+        uint256 stakeAmountUsdc;
+        uint256 baseApyBps;
+        uint256 flexibleApyBps;
         bool    flexibleEnabled;
     }
     NonMemberConfig public nonMemberConfig;
 
     // ─── Fixed-term config ────────────────────────────────────────────────────
     uint8[]  public validTerms;
-    mapping(uint8 => uint256) public termMultiplierBps; // e.g. 3mo -> 10500 (105%)
+    mapping(uint8 => uint256) public termMultiplierBps;
     bool    public memberFlexibleEnabled;
     uint256 public memberFlexibleApyBps;
 
     // ─── Card serial tracking ─────────────────────────────────────────────────
-    mapping(uint8 => uint256) public nextSerial;   // next serial to assign (starts at 1)
-    mapping(uint8 => mapping(uint256 => address)) public cardOwner; // tier -> serial -> owner
-
-    // Owned serial list per (owner, tier) with O(1) removal via swap-and-pop
+    mapping(uint8 => uint256) public nextSerial;
+    mapping(uint8 => mapping(uint256 => address)) public cardOwner;
     mapping(address => mapping(uint8 => uint256[])) private _ownedSerials;
-    mapping(uint8 => mapping(uint256 => uint256))   private _ownedSerialIndex; // tier -> serial -> index
+    mapping(uint8 => mapping(uint256 => uint256))   private _ownedSerialIndex;
+    mapping(uint8 => mapping(uint256 => bool))      public  cardStaked;
 
-    // Staked flag: card cannot be transferred while staked
-    mapping(uint8 => mapping(uint256 => bool)) public cardStaked;
+    mapping(uint8 => uint256) public totalLockedByTier;
 
-    // Active position per card: stores (stakeId + 1), so 0 = "no active position"
-    mapping(uint8 => mapping(uint256 => uint256)) private _activePositionByCard;
-
-    // ─── Global staked counts ─────────────────────────────────────────────────
-    mapping(uint8 => uint256) public totalStakedByTier;
-
-    // ─── Stake records ────────────────────────────────────────────────────────
+    // ─── Non-member stake records ─────────────────────────────────────────────
     struct StakeRecord {
-        bool    isMember;       // true = card-linked member position
-        uint8   tier;           // tier of linked card (0 for non-member)
-        uint256 cardSerial;     // serial of linked card (0 for non-member)
         bool    isFlexible;
         uint8   termMonths;
-        uint256 snapshotApyBps; // effective APY locked at stake time
-        uint256 usdcAmount;     // principal USDC deposited
+        uint256 snapshotApyBps;
+        uint256 usdcAmount;
         uint256 stakedAt;
-        uint256 unlockedAt;     // for flexible = stakedAt (no lock)
+        uint256 unlockedAt;
         uint256 lastClaimAt;
         bool    active;
     }
@@ -158,38 +127,124 @@ contract BiliquidVIPCard is
     uint256 public constant SECONDS_PER_DAY   = 86_400;
     uint256 public constant SECONDS_PER_MONTH = 30 * 86_400;
 
+    // ─── Card locking ─────────────────────────────────────────────────────────
+    mapping(uint8 => mapping(uint256 => address)) public lockedBy;
+    mapping(address => mapping(uint8 => uint256)) public lockedCardCount;
+
+    // ─── Minter allowlist (for admin-granted direct minting of Platinum+) ─────
+    mapping(address => bool) public minters;
+
+    // ─── Member positions (one per locked card) ───────────────────────────────
+    struct Position {
+        bool     active;
+        bool     isFlexible;
+        uint8    termMonths;
+        uint256  usdcPrincipal;
+        uint256  snapshotApyBps;
+        uint256  openedAt;
+        uint256  unlockedAt;
+        uint256  lastClaimAt;
+    }
+    mapping(uint8 => mapping(uint256 => Position)) public positions;
+
+    // ─── Per-user locked serial index (for dashboard discovery) ──────────────
+    mapping(address => mapping(uint8 => uint256[])) private _lockedSerials;
+    mapping(uint8 => mapping(uint256 => uint256))   private _lockedSerialIndex;
+
     // ─── Events ───────────────────────────────────────────────────────────────
     event Registered      (address indexed wallet, address indexed referrer, uint8 role);
     event CardMinted      (address indexed to, uint8 indexed tier, uint256 serial);
     event CardGifted      (address indexed to, uint8 indexed tier, uint256 serial);
     event CardTransferred (address indexed from, address indexed to, uint8 tier, uint256 serial);
-    // v3: member staking emits CardLocked then UsdcDeposited separately.
-    // Non-member staking still emits Staked (one-step, unchanged).
-    event CardLocked      (address indexed staker, uint256 indexed stakeId,
-                           uint8 tier, uint256 cardSerial,
-                           uint8 termMonths, bool isFlexible,
+    event CardLocked      (address indexed locker, uint8 indexed tier, uint256 indexed serial);
+    event CardUnlocked    (address indexed locker, uint8 indexed tier, uint256 indexed serial);
+    event CardSynthesized (address indexed user, uint8 fromTier, uint8 toTier, uint256 newSerial);
+
+    event PositionOpenedV2     (address indexed staker, uint8 indexed tier, uint256 indexed serial,
+                                uint8 termMonths, bool isFlexible,
+                                uint256 amount, uint256 snapshotApyBps, uint256 unlockedAt);
+    event PositionClosedV2     (address indexed staker, uint8 indexed tier, uint256 indexed serial,
+                                uint256 principalReturned, uint256 interestPaid);
+    event AmountAdded          (address indexed staker, uint8 indexed tier, uint256 indexed serial,
+                                uint256 amount, uint256 newTotal);
+    event PartialWithdrawn     (address indexed staker, uint8 indexed tier, uint256 indexed serial,
+                                uint256 amount, uint256 newTotal);
+    event TermsUpgraded        (address indexed staker, uint8 indexed tier, uint256 indexed serial,
+                                uint8 newTermMonths, uint256 newSnapshotApyBps, uint256 newUnlockedAt);
+    event MemberInterestClaimed(address indexed staker, uint8 indexed tier, uint256 indexed serial,
+                                uint256 usdcAmount);
+
+    event Staked          (address indexed staker, uint256 indexed stakeId,
+                           uint256 usdcAmount, uint8 termMonths, bool isFlexible,
                            uint256 snapshotApyBps, uint256 unlockedAt);
-    event UsdcDeposited   (address indexed staker, uint256 indexed stakeId, uint256 amount);
-    event Staked          (address indexed staker, uint256 indexed stakeId, bool isMember,
-                           uint8 tier, uint256 cardSerial, uint256 usdcAmount,
-                           uint8 termMonths, bool isFlexible, uint256 snapshotApyBps, uint256 unlockedAt);
     event Unstaked        (address indexed staker, uint256 indexed stakeId);
-    event InterestClaimed (address indexed staker, uint256 indexed stakeId,
-                           uint256 usdcAmount, uint256 daysAccrued);
-    event ReferralReward  (address indexed recipient, address indexed buyer,
-                           uint256 usdcAmt, string reason);
+    event InterestClaimed (address indexed staker, uint256 indexed stakeId, uint256 usdcAmount, uint256 daysAccrued);
+    event ReferralReward  (address indexed recipient, address indexed buyer, uint256 usdcAmt, string reason);
     event TierUpdated     (uint8 tier);
     event TermAdded       (uint8 termMonths, uint256 multiplierBps);
     event TermRemoved     (uint8 termMonths);
 
-    // ─── Modifiers ────────────────────────────────────────────────────────────
-    modifier notPaused() { require(!paused, "BiliquidVIPCard: paused"); _; }
+    // ─── Custom errors ────────────────────────────────────────────────────────
+    error Reentrant();
+    error Paused();
+    error AlreadyRegistered();
+    error SelfRefer();
+    error ReferrerNotRegistered();
+    error ChainTooDeep();
+    error InvalidRole();
+    error ZeroAmount();
+    error MintCapReached();
+    error PaymentFailed();
+    error ZeroRecipient();
+    error NotInGiftPool();
+    error CardStaked();
+    error ZeroAddress();
+    error NotOwner();
+    error CardIsLocked();
+    error NotCardOwner();
+    error AlreadyLocked();
+    error NotCardLocker();
+    error PositionAlreadyOpen();
+    error ExceedsCardCapacity();
+    error UsdcTransferFailed();
+    error NoActivePosition();
+    error UseClosePosition();
+    error StillLocked();
+    error CannotUpgradeFlexible();
+    error InvalidTerm();
+    error MustUpgradeToLonger();
+    error NoUsdcDeposited();
+    error ClaimOncePer30Days();
+    error LengthMismatch();
+    error TermMustBePositive();
+    error TermExists();
+    error TermNotFound();
+    error CloseV6First();
+    error PrincipalReturnFailed();
+    error UseNonMemberUnstake();
+    error UsdcReturnFailed();
+    error NonMemberFlexibleDisabled();
+    error FlexibleStakingDisabled();
+    error InterestTransferFailed();
+    error InvalidTier();
+    error InvalidStakeId();
+    error PositionNotActive();
+    error WithdrawFailed();
+    error OnlyMinter();
+    error SynthTierInvalid();
+    error SynthNotOwner();
+    error SynthMintCap();
 
-    // ─── Constructor ─────────────────────────────────────────────────────────
+    // ─── Modifiers ────────────────────────────────────────────────────────────
+    modifier notPaused() { if (paused) revert Paused(); _; }
+
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() { _disableInitializers(); }
 
-    // ─── Initializer ─────────────────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  INITIALIZER
+    // ═══════════════════════════════════════════════════════════════════════════
+
     function initialize(address _usdc, address _treasury) external initializer {
         __Ownable_init(msg.sender);
         _reentrancyStatus = 1;
@@ -197,41 +252,28 @@ contract BiliquidVIPCard is
         treasury = _treasury;
         uri      = "https://biliquid.io/metadata/{id}.json";
 
-        // Referral rates
-        directReferralBps   = 1000; // 10 %
-        indirectReferralBps =  500; //  5 %
-        nodeBoostBps        =  500; //  5 %
-        superNodeBps        =  500; //  5 %
-        generalAgentBps     =  500; //  5 %
+        directReferralBps   = 1000;
+        indirectReferralBps =  500;
+        nodeBoostBps        =  500;
+        superNodeBps        =  500;
+        generalAgentBps     =  500;
 
-        // Fixed terms: 3 / 6 / 12 months
-        _addTerm(3,  10500);  // +5 %
-        _addTerm(6,  11000);  // +10 %
-        _addTerm(12, 11500);  // +15 %
-
-        // Member flexible staking: disabled by default, 6 %
+        _addTerm(3,  10000);
+        _addTerm(6,  13333);
+        _addTerm(12, 20000);
         memberFlexibleEnabled = false;
         memberFlexibleApyBps  = 600;
 
-        // Tier configs
-        tierConfigs[GOLD]     = TierConfig({ mintPrice: 30_000_000,    maxStakeAmountUsdc: 30_000_000,    apyBps: 900,  maxStakeCount: 100_000 });
-        tierConfigs[PLATINUM] = TierConfig({ mintPrice: 120_000_000,   maxStakeAmountUsdc: 120_000_000,   apyBps: 1000, maxStakeCount:  25_000 });
-        tierConfigs[DIAMOND]  = TierConfig({ mintPrice: 480_000_000,   maxStakeAmountUsdc: 480_000_000,   apyBps: 1200, maxStakeCount:  10_000 });
-        tierConfigs[BLACK]    = TierConfig({ mintPrice: 1_920_000_000, maxStakeAmountUsdc: 1_920_000_000, apyBps: 1500, maxStakeCount:   2_500 });
+        tierConfigs[GOLD]     = TierConfig({ mintPrice: 30_000_000,    maxStakeAmountUsdc: 300_000_000,    apyBps: 900,  mintCap: 100_000 });
+        tierConfigs[PLATINUM] = TierConfig({ mintPrice: 120_000_000,   maxStakeAmountUsdc: 1_500_000_000,  apyBps: 1000, mintCap:  25_000 });
+        tierConfigs[DIAMOND]  = TierConfig({ mintPrice: 480_000_000,   maxStakeAmountUsdc: 8_500_000_000,  apyBps: 1100, mintCap:  10_000 });
+        tierConfigs[BLACK]    = TierConfig({ mintPrice: 1_920_000_000, maxStakeAmountUsdc: 80_000_000_000, apyBps: 1250, mintCap:   2_500 });
 
-        // Non-member config: 100 USDC, 4 % base, 3 % flexible
-        nonMemberConfig = NonMemberConfig({
-            stakeAmountUsdc: 100_000_000,
-            baseApyBps:      400,
-            flexibleApyBps:  300,
-            flexibleEnabled: false
-        });
+        nonMemberConfig = NonMemberConfig({ stakeAmountUsdc: 100_000_000, baseApyBps: 300, flexibleApyBps: 300, flexibleEnabled: false });
 
-        // Serials start at 1
         nextSerial[GOLD] = nextSerial[PLATINUM] = nextSerial[DIAMOND] = nextSerial[BLACK] = 1;
     }
 
-    // ─── UUPS ─────────────────────────────────────────────────────────────────
     function _authorizeUpgrade(address) internal override onlyOwner {}
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -239,14 +281,14 @@ contract BiliquidVIPCard is
     // ═══════════════════════════════════════════════════════════════════════════
 
     function register(address referrer) external {
-        require(registrationDepth[msg.sender] == 0, "BiliquidVIPCard: already registered");
+        if (registrationDepth[msg.sender] != 0) revert AlreadyRegistered();
         if (referrer == address(0)) {
             registrationDepth[msg.sender] = 1;
         } else {
-            require(referrer != msg.sender, "BiliquidVIPCard: self-refer");
+            if (referrer == msg.sender) revert SelfRefer();
             uint256 d = registrationDepth[referrer];
-            require(d > 0, "BiliquidVIPCard: referrer not registered");
-            require(d < MAX_REFERRAL_DEPTH, "BiliquidVIPCard: chain too deep");
+            if (d == 0) revert ReferrerNotRegistered();
+            if (d >= MAX_REFERRAL_DEPTH) revert ChainTooDeep();
             registrationDepth[msg.sender] = d + 1;
             referrerOf[msg.sender] = referrer;
         }
@@ -254,7 +296,7 @@ contract BiliquidVIPCard is
     }
 
     function setRole(address wallet, uint8 role) external onlyOwner {
-        require(role <= ROLE_GENERAL_AGENT, "BiliquidVIPCard: invalid role");
+        if (role > ROLE_GENERAL_AGENT) revert InvalidRole();
         roleOf[wallet] = role;
         emit Registered(wallet, referrerOf[wallet], role);
     }
@@ -263,205 +305,275 @@ contract BiliquidVIPCard is
     //  MINTING
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// @notice Purchase `amount` cards of `tier`. USDC is pulled from the caller.
     function mintCard(uint8 tier, uint256 amount) external notPaused nonReentrant {
         _requireValidTier(tier);
-        require(amount > 0, "BiliquidVIPCard: amount=0");
-
-        uint256 totalCost = tierConfigs[tier].mintPrice * amount;
-        require(usdc.transferFrom(msg.sender, address(this), totalCost), "BiliquidVIPCard: payment failed");
-
+        if (amount == 0) revert ZeroAmount();
+        if (tier > GOLD && !minters[msg.sender]) revert OnlyMinter();
+        TierConfig storage cfg = tierConfigs[tier];
+        if (nextSerial[tier] - 1 + amount > cfg.mintCap) revert MintCapReached();
+        uint256 totalCost = cfg.mintPrice * amount;
+        if (!usdc.transferFrom(msg.sender, address(this), totalCost)) revert PaymentFailed();
         for (uint256 i = 0; i < amount; i++) {
             uint256 serial = nextSerial[tier]++;
             _assignCard(msg.sender, tier, serial);
             emit CardMinted(msg.sender, tier, serial);
         }
-
         _distributeReferralRewards(msg.sender, totalCost);
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  GIFT POOL  (admin only)
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    /// @notice Pre-mint cards into the contract's gift pool (no USDC required).
     function adminMintToPool(uint8 tier, uint256 amount) external onlyOwner {
         _requireValidTier(tier);
-        require(amount > 0, "BiliquidVIPCard: amount=0");
+        if (amount == 0) revert ZeroAmount();
         for (uint256 i = 0; i < amount; i++) {
             uint256 serial = nextSerial[tier]++;
             _assignCard(address(this), tier, serial);
         }
     }
 
-    /// @notice Gift a card from the pool to `recipient`.
     function giftCard(uint8 tier, uint256 serial, address recipient) external onlyOwner {
-        require(recipient != address(0), "BiliquidVIPCard: zero recipient");
-        require(cardOwner[tier][serial] == address(this), "BiliquidVIPCard: not in gift pool");
-        require(!cardStaked[tier][serial], "BiliquidVIPCard: card staked");
+        if (recipient == address(0)) revert ZeroRecipient();
+        if (cardOwner[tier][serial] != address(this)) revert NotInGiftPool();
+        if (cardStaked[tier][serial]) revert CardStaked();
         _transferCard(address(this), recipient, tier, serial);
         emit CardGifted(recipient, tier, serial);
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  CARD TRANSFER
-    // ═══════════════════════════════════════════════════════════════════════════
-
     function transferCard(uint8 tier, uint256 serial, address to) external notPaused {
-        require(to != address(0), "BiliquidVIPCard: zero address");
-        require(cardOwner[tier][serial] == msg.sender, "BiliquidVIPCard: not owner");
-        require(!cardStaked[tier][serial], "BiliquidVIPCard: card is staked");
+        if (to == address(0)) revert ZeroAddress();
+        if (cardOwner[tier][serial] != msg.sender) revert NotOwner();
+        if (cardStaked[tier][serial]) revert CardIsLocked();
         _transferCard(msg.sender, to, tier, serial);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  MEMBER STAKING  (v3 two-step: lockCard → depositUsdc)
+    //  CARD SYNTHESIS
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// @notice Step 1 — Lock a VIP card for a term. No USDC is required here.
-    ///         The returned stakeId is used in the subsequent depositUsdc() call.
-    /// @param termMonths  0 = flexible; 3/6/12 = fixed term.
-    function lockCard(
-        uint8   tier,
-        uint256 cardSerial,
-        uint8   termMonths
-    ) external notPaused nonReentrant returns (uint256 stakeId) {
+    /// @notice Synthesize 4 cards of `fromTier` into 1 card of the next tier.
+    ///         All 4 serials must be distinct, owned by caller, and unlocked (no USDC cost).
+    ///         Interleaved check+burn prevents duplicate-serial exploits.
+    function synthesizeCard(uint8 fromTier, uint256 s0, uint256 s1, uint256 s2, uint256 s3)
+        external notPaused nonReentrant
+    {
+        if (fromTier < GOLD || fromTier >= BLACK) revert SynthTierInvalid();
+        uint8 toTier = fromTier + 1;
+        if (nextSerial[toTier] > tierConfigs[toTier].mintCap) revert SynthMintCap();
+        address me = msg.sender;
+        if (cardOwner[fromTier][s0] != me) revert SynthNotOwner(); _transferCard(me, address(0), fromTier, s0);
+        if (cardOwner[fromTier][s1] != me) revert SynthNotOwner(); _transferCard(me, address(0), fromTier, s1);
+        if (cardOwner[fromTier][s2] != me) revert SynthNotOwner(); _transferCard(me, address(0), fromTier, s2);
+        if (cardOwner[fromTier][s3] != me) revert SynthNotOwner(); _transferCard(me, address(0), fromTier, s3);
+        uint256 newSerial = nextSerial[toTier]++;
+        _assignCard(me, toTier, newSerial);
+        emit CardSynthesized(me, fromTier, toTier, newSerial);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  MEMBER STAKING
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function lockCard(uint8 tier, uint256 cardSerial) external notPaused nonReentrant {
         _requireValidTier(tier);
-        require(cardOwner[tier][cardSerial] == msg.sender,    "BiliquidVIPCard: not card owner");
-        require(!cardStaked[tier][cardSerial],                "BiliquidVIPCard: card already staked");
-        require(_activePositionByCard[tier][cardSerial] == 0, "BiliquidVIPCard: card has active position");
+        if (cardOwner[tier][cardSerial] != msg.sender) revert NotCardOwner();
+        if (cardStaked[tier][cardSerial]) revert AlreadyLocked();
 
-        TierConfig storage cfg = tierConfigs[tier];
-        require(totalStakedByTier[tier] < cfg.maxStakeCount, "BiliquidVIPCard: tier stake cap reached");
-
-        (bool isFlexible_, uint256 snapshotApy, uint256 lockSeconds) =
-            _memberTermParams(cfg.apyBps, termMonths);
-
+        _transferCard(msg.sender, address(this), tier, cardSerial);
         cardStaked[tier][cardSerial] = true;
-        totalStakedByTier[tier]++;
+        lockedBy[tier][cardSerial]   = msg.sender;
+        totalLockedByTier[tier]++;
+        lockedCardCount[msg.sender][tier]++;
 
-        uint256 now_ = block.timestamp;
-        stakeId = stakeRecords[msg.sender].length;
-        stakeRecords[msg.sender].push(StakeRecord({
-            isMember:       true,
-            tier:           tier,
-            cardSerial:     cardSerial,
-            isFlexible:     isFlexible_,
-            termMonths:     termMonths,
-            snapshotApyBps: snapshotApy,
-            usdcAmount:     0,           // no USDC yet; filled by depositUsdc()
-            stakedAt:       now_,
-            unlockedAt:     now_ + lockSeconds,
-            lastClaimAt:    0,           // sentinel: 0 means USDC not yet deposited
-            active:         true
-        }));
+        _lockedSerialIndex[tier][cardSerial] = _lockedSerials[msg.sender][tier].length;
+        _lockedSerials[msg.sender][tier].push(cardSerial);
 
-        _activePositionByCard[tier][cardSerial] = stakeId + 1;
-
-        emit CardLocked(msg.sender, stakeId, tier, cardSerial,
-                        termMonths, isFlexible_, snapshotApy, now_ + lockSeconds);
+        emit CardLocked(msg.sender, tier, cardSerial);
     }
 
-    /// @notice Step 2 — Deposit USDC into a locked card position to start earning APY.
-    ///         Can only be called once per stakeId. APY accrual begins at deposit time.
-    /// @param stakeId  The stakeId returned by lockCard().
-    /// @param amount   USDC amount (6 dec). Must be between 1 and maxStakeAmountUsdc.
-    function depositUsdc(uint256 stakeId, uint256 amount) external notPaused nonReentrant {
-        require(stakeId < stakeRecords[msg.sender].length, "BiliquidVIPCard: invalid stakeId");
-        StakeRecord storage rec = stakeRecords[msg.sender][stakeId];
-        require(rec.active,    "BiliquidVIPCard: position not active");
-        require(rec.isMember,  "BiliquidVIPCard: not a member position");
-        require(rec.usdcAmount == 0, "BiliquidVIPCard: USDC already deposited");
-        require(amount > 0,    "BiliquidVIPCard: amount must be > 0");
-
-        TierConfig storage cfg = tierConfigs[rec.tier];
-        require(amount <= cfg.maxStakeAmountUsdc, "BiliquidVIPCard: exceeds max stake amount");
-
-        require(usdc.transferFrom(msg.sender, address(this), amount), "BiliquidVIPCard: usdc transfer failed");
-
-        rec.usdcAmount  = amount;
-        rec.lastClaimAt = block.timestamp; // APY accrual starts from now
-
-        emit UsdcDeposited(msg.sender, stakeId, amount);
-    }
-
-    /// @notice One-step convenience: lock card AND deposit maxStakeAmountUsdc in a single tx.
-    ///         Kept for backward compatibility; the preferred flow is lockCard() + depositUsdc().
-    function stakeCard(uint8 tier, uint256 cardSerial, uint8 termMonths)
-        external notPaused nonReentrant returns (uint256 stakeId)
+    /// @param termMonths 0 = flexible; 3/6/12 = fixed-term.
+    function openPosition(uint8 tier, uint256 cardSerial, uint8 termMonths, uint256 amount)
+        external notPaused nonReentrant
     {
         _requireValidTier(tier);
-        require(cardOwner[tier][cardSerial] == msg.sender,    "BiliquidVIPCard: not card owner");
-        require(!cardStaked[tier][cardSerial],                "BiliquidVIPCard: card already staked");
-        require(_activePositionByCard[tier][cardSerial] == 0, "BiliquidVIPCard: card has active position");
+        if (lockedBy[tier][cardSerial] != msg.sender) revert NotCardLocker();
+        if (!cardStaked[tier][cardSerial]) revert NotCardOwner();
+        if (amount == 0) revert ZeroAmount();
+        if (positions[tier][cardSerial].active) revert PositionAlreadyOpen();
 
         TierConfig storage cfg = tierConfigs[tier];
-        require(totalStakedByTier[tier] < cfg.maxStakeCount, "BiliquidVIPCard: tier stake cap reached");
+        if (amount > cfg.maxStakeAmountUsdc) revert ExceedsCardCapacity();
 
         (bool isFlexible_, uint256 snapshotApy, uint256 lockSeconds) =
             _memberTermParams(cfg.apyBps, termMonths);
 
-        uint256 usdcAmount = cfg.maxStakeAmountUsdc;
-        require(usdc.transferFrom(msg.sender, address(this), usdcAmount), "BiliquidVIPCard: usdc transfer failed");
+        if (!usdc.transferFrom(msg.sender, address(this), amount)) revert UsdcTransferFailed();
 
-        cardStaked[tier][cardSerial] = true;
-        totalStakedByTier[tier]++;
+        uint256 now_    = block.timestamp;
+        uint256 unlock_ = isFlexible_ ? 0 : now_ + lockSeconds;
 
-        uint256 now_ = block.timestamp;
-        stakeId = stakeRecords[msg.sender].length;
-        stakeRecords[msg.sender].push(StakeRecord({
-            isMember:       true,
-            tier:           tier,
-            cardSerial:     cardSerial,
+        positions[tier][cardSerial] = Position({
+            active:         true,
             isFlexible:     isFlexible_,
             termMonths:     termMonths,
+            usdcPrincipal:  amount,
             snapshotApyBps: snapshotApy,
-            usdcAmount:     usdcAmount,
-            stakedAt:       now_,
-            unlockedAt:     now_ + lockSeconds,
-            lastClaimAt:    now_,
-            active:         true
-        }));
+            openedAt:       now_,
+            unlockedAt:     unlock_,
+            lastClaimAt:    now_
+        });
 
-        _activePositionByCard[tier][cardSerial] = stakeId + 1;
+        emit PositionOpenedV2(msg.sender, tier, cardSerial, termMonths, isFlexible_, amount, snapshotApy, unlock_);
+    }
 
-        emit CardLocked(msg.sender, stakeId, tier, cardSerial, termMonths, isFlexible_, snapshotApy, now_ + lockSeconds);
-        emit UsdcDeposited(msg.sender, stakeId, usdcAmount);
+    /// @notice Add USDC to an active position. Settles accrued interest first.
+    function addToPosition(uint8 tier, uint256 serial, uint256 amount) external notPaused nonReentrant {
+        _requireValidTier(tier);
+        if (lockedBy[tier][serial] != msg.sender) revert NotCardLocker();
+        Position storage p = positions[tier][serial];
+        if (!p.active) revert NoActivePosition();
+        if (amount == 0) revert ZeroAmount();
+        TierConfig storage cfg = tierConfigs[tier];
+        if (p.usdcPrincipal + amount > cfg.maxStakeAmountUsdc) revert ExceedsCardCapacity();
+
+        _settleAndPay(tier, serial, msg.sender);
+        if (!usdc.transferFrom(msg.sender, address(this), amount)) revert UsdcTransferFailed();
+        p.usdcPrincipal += amount;
+
+        emit AmountAdded(msg.sender, tier, serial, amount, p.usdcPrincipal);
+    }
+
+    /// @notice Reduce principal. Settles accrued interest first.
+    ///         Flexible: any time. Fixed-term: post-expiry only.
+    function partialWithdraw(uint8 tier, uint256 serial, uint256 amount) external notPaused nonReentrant {
+        _requireValidTier(tier);
+        if (lockedBy[tier][serial] != msg.sender) revert NotCardLocker();
+        Position storage p = positions[tier][serial];
+        if (!p.active) revert NoActivePosition();
+        if (amount == 0) revert ZeroAmount();
+        if (amount >= p.usdcPrincipal) revert UseClosePosition();
+        if (!p.isFlexible && block.timestamp < p.unlockedAt) revert StillLocked();
+
+        _settleAndPay(tier, serial, msg.sender);
+        p.usdcPrincipal -= amount;
+        if (!usdc.transfer(msg.sender, amount)) revert WithdrawFailed();
+
+        emit PartialWithdrawn(msg.sender, tier, serial, amount, p.usdcPrincipal);
+    }
+
+    /// @notice Upgrade a fixed-term to a longer term. Settles accrued interest first.
+    ///         New APY = baseApy * termMultiplier[newTerm].
+    ///         New unlock = openedAt + newTermMonths*30d (anchored to open time).
+    function upgradeTerms(uint8 tier, uint256 serial, uint8 newTermMonths) external notPaused nonReentrant {
+        _requireValidTier(tier);
+        if (lockedBy[tier][serial] != msg.sender) revert NotCardLocker();
+        Position storage p = positions[tier][serial];
+        if (!p.active) revert NoActivePosition();
+        if (p.isFlexible) revert CannotUpgradeFlexible();
+        if (!_isValidTerm(newTermMonths)) revert InvalidTerm();
+        if (newTermMonths <= p.termMonths) revert MustUpgradeToLonger();
+
+        _settleAndPay(tier, serial, msg.sender);
+
+        TierConfig storage cfg = tierConfigs[tier];
+        uint256 newApy      = cfg.apyBps * termMultiplierBps[newTermMonths] / 10_000;
+        uint256 newUnlockAt = p.openedAt + uint256(newTermMonths) * SECONDS_PER_MONTH;
+
+        p.termMonths     = newTermMonths;
+        p.snapshotApyBps = newApy;
+        p.unlockedAt     = newUnlockAt;
+
+        emit TermsUpgraded(msg.sender, tier, serial, newTermMonths, newApy, newUnlockAt);
+    }
+
+    /// @notice Settle and pay all accrued interest for one position.
+    function claimMemberInterest(uint8 tier, uint256 serial) external nonReentrant {
+        _requireValidTier(tier);
+        if (lockedBy[tier][serial] != msg.sender) revert NotCardLocker();
+        Position storage p = positions[tier][serial];
+        if (!p.active) revert NoActivePosition();
+        _settleAndPay(tier, serial, msg.sender);
+    }
+
+    /// @notice Claim accrued interest for ALL active member positions of caller.
+    function claimAllInterest() external nonReentrant {
+        uint8[4] memory tiers_ = [GOLD, PLATINUM, DIAMOND, BLACK];
+        for (uint256 t = 0; t < 4; t++) {
+            uint8 tier = tiers_[t];
+            uint256[] storage ls = _lockedSerials[msg.sender][tier];
+            uint256 len = ls.length;
+            for (uint256 i = 0; i < len; i++) {
+                uint256 serial = ls[i];
+                if (positions[tier][serial].active) {
+                    _settleAndPay(tier, serial, msg.sender);
+                }
+            }
+        }
+    }
+
+    /// @notice Close a member position: settle interest + return full principal.
+    ///         Card remains locked; call unlockCard() separately to get it back.
+    function closePosition(uint8 tier, uint256 serial) external nonReentrant {
+        _requireValidTier(tier);
+        if (lockedBy[tier][serial] != msg.sender) revert NotCardLocker();
+        Position storage p = positions[tier][serial];
+        if (!p.active) revert NoActivePosition();
+        if (!p.isFlexible && block.timestamp < p.unlockedAt) revert StillLocked();
+
+        uint256 principal = p.usdcPrincipal;
+        uint256 interest  = _settleAndPay(tier, serial, msg.sender);
+
+        p.active        = false;
+        p.usdcPrincipal = 0;
+
+        if (!usdc.transfer(msg.sender, principal)) revert PrincipalReturnFailed();
+        emit PositionClosedV2(msg.sender, tier, serial, principal, interest);
+    }
+
+    /// @notice Return the locked card to the caller's wallet.
+    ///         Requires: position must be closed first.
+    function unlockCard(uint8 tier, uint256 cardSerial) external nonReentrant {
+        if (lockedBy[tier][cardSerial] != msg.sender) revert NotCardLocker();
+        if (positions[tier][cardSerial].active) revert CloseV6First();
+
+        lockedBy[tier][cardSerial]   = address(0);
+        cardStaked[tier][cardSerial] = false;
+        totalLockedByTier[tier]--;
+        if (lockedCardCount[msg.sender][tier] > 0) lockedCardCount[msg.sender][tier]--;
+
+        uint256[] storage ls = _lockedSerials[msg.sender][tier];
+        uint256 idx_         = _lockedSerialIndex[tier][cardSerial];
+        uint256 last_        = ls[ls.length - 1];
+        ls[idx_]             = last_;
+        _lockedSerialIndex[tier][last_] = idx_;
+        ls.pop();
+        delete _lockedSerialIndex[tier][cardSerial];
+
+        _transferCard(address(this), msg.sender, tier, cardSerial);
+        emit CardUnlocked(msg.sender, tier, cardSerial);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
     //  NON-MEMBER STAKING
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// @notice Stake USDC without owning a VIP card.
     function stakeNonMember(uint8 termMonths) external notPaused nonReentrant returns (uint256 stakeId) {
         NonMemberConfig storage cfg = nonMemberConfig;
-
         bool    isFlexible_;
         uint256 snapshotApy;
         uint256 lockSeconds;
-
         if (termMonths == 0) {
-            require(cfg.flexibleEnabled, "BiliquidVIPCard: non-member flexible disabled");
-            isFlexible_ = true;
-            snapshotApy = cfg.flexibleApyBps;
-            lockSeconds = 0;
+            if (!cfg.flexibleEnabled) revert NonMemberFlexibleDisabled();
+            isFlexible_ = true; snapshotApy = cfg.flexibleApyBps; lockSeconds = 0;
         } else {
-            require(_isValidTerm(termMonths), "BiliquidVIPCard: invalid term");
+            if (!_isValidTerm(termMonths)) revert InvalidTerm();
             isFlexible_ = false;
             snapshotApy = cfg.baseApyBps * termMultiplierBps[termMonths] / 10_000;
             lockSeconds = uint256(termMonths) * SECONDS_PER_MONTH;
         }
-
         uint256 usdcAmount = cfg.stakeAmountUsdc;
-        require(usdc.transferFrom(msg.sender, address(this), usdcAmount), "BiliquidVIPCard: usdc transfer failed");
-
+        if (!usdc.transferFrom(msg.sender, address(this), usdcAmount)) revert UsdcTransferFailed();
         uint256 now_ = block.timestamp;
         stakeId = stakeRecords[msg.sender].length;
         stakeRecords[msg.sender].push(StakeRecord({
-            isMember:       false,
-            tier:           0,
-            cardSerial:     0,
             isFlexible:     isFlexible_,
             termMonths:     termMonths,
             snapshotApyBps: snapshotApy,
@@ -471,63 +583,25 @@ contract BiliquidVIPCard is
             lastClaimAt:    now_,
             active:         true
         }));
-
-        emit Staked(msg.sender, stakeId, false, 0, 0, usdcAmount,
-                    termMonths, isFlexible_, snapshotApy, now_ + lockSeconds);
+        emit Staked(msg.sender, stakeId, usdcAmount, termMonths, isFlexible_, snapshotApy, now_ + lockSeconds);
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  UNSTAKE
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    function unstake(uint256 stakeId) external nonReentrant {
+    function unstakeNonMember(uint256 stakeId) external nonReentrant {
         StakeRecord storage rec = _requireActive(msg.sender, stakeId);
-
-        if (!rec.isFlexible) {
-            require(block.timestamp >= rec.unlockedAt, "BiliquidVIPCard: still locked");
-        }
-
-        // Return USDC principal (if deposited). Positions locked without depositing USDC
-        // (usdcAmount == 0, lastClaimAt == 0) just unlock the card, no USDC to return.
-        if (rec.usdcAmount > 0) {
-            uint256 monthsPast = (block.timestamp - rec.lastClaimAt) / SECONDS_PER_MONTH;
-            if (monthsPast > 0) {
-                _claimInterest(msg.sender, stakeId, rec);
-            }
-            require(usdc.transfer(msg.sender, rec.usdcAmount), "BiliquidVIPCard: usdc return failed");
-        }
-
-        if (rec.isMember) {
-            cardStaked[rec.tier][rec.cardSerial] = false;
-            totalStakedByTier[rec.tier]--;
-            _activePositionByCard[rec.tier][rec.cardSerial] = 0;
-        }
-
+        if (!rec.isFlexible && block.timestamp < rec.unlockedAt) revert StillLocked();
+        uint256 monthsPast = (block.timestamp - rec.lastClaimAt) / SECONDS_PER_MONTH;
+        if (monthsPast > 0) _claimInterestLegacy(msg.sender, stakeId, rec);
+        if (!usdc.transfer(msg.sender, rec.usdcAmount)) revert UsdcReturnFailed();
         rec.active = false;
         emit Unstaked(msg.sender, stakeId);
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  CLAIM INTEREST
-    // ═══════════════════════════════════════════════════════════════════════════
-
     function claimInterest(uint256 stakeId) external nonReentrant {
         StakeRecord storage rec = _requireActive(msg.sender, stakeId);
-        require(rec.usdcAmount > 0, "BiliquidVIPCard: no USDC deposited");
+        if (rec.usdcAmount == 0 || rec.lastClaimAt == 0) revert NoUsdcDeposited();
         uint256 monthsPast = (block.timestamp - rec.lastClaimAt) / SECONDS_PER_MONTH;
-        require(monthsPast > 0, "BiliquidVIPCard: claim once per 30 days");
-        _claimInterest(msg.sender, stakeId, rec);
-    }
-
-    function claimAllInterest() external nonReentrant {
-        StakeRecord[] storage records = stakeRecords[msg.sender];
-        for (uint256 i = 0; i < records.length; i++) {
-            if (!records[i].active) continue;
-            if (records[i].usdcAmount == 0) continue; // card locked but no USDC deposited yet
-            uint256 monthsPast = (block.timestamp - records[i].lastClaimAt) / SECONDS_PER_MONTH;
-            if (monthsPast == 0) continue;
-            _claimInterest(msg.sender, i, records[i]);
-        }
+        if (monthsPast == 0) revert ClaimOncePer30Days();
+        _claimInterestLegacy(msg.sender, stakeId, rec);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -538,73 +612,25 @@ contract BiliquidVIPCard is
         return _ownedSerials[owner][tier];
     }
 
-    /// @return stakeId_    The active stakeId for this card.
-    /// @return hasPosition True if the card has an active stake position.
-    function getActivePositionByCard(uint8 tier, uint256 serial)
-        external view returns (uint256 stakeId_, bool hasPosition)
-    {
-        uint256 raw = _activePositionByCard[tier][serial];
-        if (raw == 0) return (0, false);
-        return (raw - 1, true);
+    function getLockedSerials(address owner, uint8 tier) external view returns (uint256[] memory) {
+        return _lockedSerials[owner][tier];
     }
 
     function getStakeRecords(address wallet) external view returns (StakeRecord[] memory) {
         return stakeRecords[wallet];
     }
 
-    /// @notice Claimable interest (whole months only, same rounding as actual claim).
-    function pendingInterest(address wallet, uint256 stakeId) external view returns (uint256) {
-        if (stakeId >= stakeRecords[wallet].length) return 0;
-        StakeRecord storage rec = stakeRecords[wallet][stakeId];
-        if (!rec.active) return 0;
-        uint256 monthsPast = (block.timestamp - rec.lastClaimAt) / SECONDS_PER_MONTH;
-        if (monthsPast == 0) return 0;
-        return _dailyInterest(rec) * (monthsPast * 30);
+    function getPosition(uint8 tier, uint256 serial) external view returns (Position memory) {
+        return positions[tier][serial];
     }
 
-    /// @notice Accrued interest by day (not yet claimable unless >= 30 days).
-    function pendingInterestExact(address wallet, uint256 stakeId) external view returns (uint256) {
-        if (stakeId >= stakeRecords[wallet].length) return 0;
-        StakeRecord storage rec = stakeRecords[wallet][stakeId];
-        if (!rec.active) return 0;
-        uint256 daysPast = (block.timestamp - rec.lastClaimAt) / SECONDS_PER_DAY;
-        return _dailyInterest(rec) * daysPast;
+    function pendingMemberInterest(uint8 tier, uint256 serial) external view returns (uint256) {
+        Position storage p = positions[tier][serial];
+        if (!p.active || p.usdcPrincipal == 0) return 0;
+        return p.usdcPrincipal * p.snapshotApyBps * (block.timestamp - p.lastClaimAt) / (10_000 * 365 days);
     }
 
-    function dailyInterestFor(address wallet, uint256 stakeId) external view returns (uint256) {
-        if (stakeId >= stakeRecords[wallet].length) return 0;
-        StakeRecord storage rec = stakeRecords[wallet][stakeId];
-        if (!rec.active) return 0;
-        return _dailyInterest(rec);
-    }
-
-    /// @notice Summary of a wallet's card holdings and staking activity.
-    function getUserState(address wallet) external view returns (
-        uint256 goldCards,     uint256 platinumCards, uint256 diamondCards, uint256 blackCards,
-        uint256 goldStaked,    uint256 platinumStaked, uint256 diamondStaked, uint256 blackStaked,
-        address referrer,      uint8   role
-    ) {
-        goldCards     = _ownedSerials[wallet][GOLD].length;
-        platinumCards = _ownedSerials[wallet][PLATINUM].length;
-        diamondCards  = _ownedSerials[wallet][DIAMOND].length;
-        blackCards    = _ownedSerials[wallet][BLACK].length;
-
-        StakeRecord[] storage records = stakeRecords[wallet];
-        for (uint256 i = 0; i < records.length; i++) {
-            if (!records[i].active || !records[i].isMember) continue;
-            uint8 t = records[i].tier;
-            if      (t == GOLD)     goldStaked++;
-            else if (t == PLATINUM) platinumStaked++;
-            else if (t == DIAMOND)  diamondStaked++;
-            else if (t == BLACK)    blackStaked++;
-        }
-        referrer = referrerOf[wallet];
-        role     = roleOf[wallet];
-    }
-
-    function getValidTerms() external view returns (uint8[] memory) {
-        return validTerms;
-    }
+    function getValidTerms() external view returns (uint8[] memory) { return validTerms; }
 
     // ─── ERC-1155 standard views ───────────────────────────────────────────────
     function balanceOf(address account, uint256 id) public view returns (uint256) {
@@ -614,11 +640,9 @@ contract BiliquidVIPCard is
     function balanceOfBatch(address[] calldata accounts, uint256[] calldata ids)
         external view returns (uint256[] memory out)
     {
-        require(accounts.length == ids.length, "BiliquidVIPCard: length mismatch");
+        if (accounts.length != ids.length) revert LengthMismatch();
         out = new uint256[](accounts.length);
-        for (uint256 i = 0; i < accounts.length; i++) {
-            out[i] = _balances[accounts[i]][ids[i]];
-        }
+        for (uint256 i = 0; i < accounts.length; i++) { out[i] = _balances[accounts[i]][ids[i]]; }
     }
 
     function isApprovedForAll(address account, address operator) public view returns (bool) {
@@ -631,39 +655,26 @@ contract BiliquidVIPCard is
     }
 
     function supportsInterface(bytes4 id) external pure returns (bool) {
-        return id == 0xd9b67a26  // ERC-1155
-            || id == 0x0e89341c  // ERC-1155MetadataURI
-            || id == 0x01ffc9a7; // ERC-165
+        return id == 0xd9b67a26 || id == 0x0e89341c || id == 0x01ffc9a7;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
     //  ADMIN CONFIG
     // ═══════════════════════════════════════════════════════════════════════════
 
-    function setTierConfig(
-        uint8   tier,
-        uint256 mintPrice,
-        uint256 maxStakeAmountUsdc,
-        uint256 apyBps,
-        uint256 maxStakeCount
-    ) external onlyOwner {
+    function setTierConfig(uint8 tier, uint256 mintPrice, uint256 maxStakeAmountUsdc, uint256 apyBps, uint256 mintCap) external onlyOwner {
         _requireValidTier(tier);
-        tierConfigs[tier] = TierConfig(mintPrice, maxStakeAmountUsdc, apyBps, maxStakeCount);
+        tierConfigs[tier] = TierConfig(mintPrice, maxStakeAmountUsdc, apyBps, mintCap);
         emit TierUpdated(tier);
     }
 
-    function setNonMemberConfig(
-        uint256 stakeAmountUsdc,
-        uint256 baseApyBps,
-        uint256 flexibleApyBps,
-        bool    flexibleEnabled
-    ) external onlyOwner {
+    function setNonMemberConfig(uint256 stakeAmountUsdc, uint256 baseApyBps, uint256 flexibleApyBps, bool flexibleEnabled) external onlyOwner {
         nonMemberConfig = NonMemberConfig(stakeAmountUsdc, baseApyBps, flexibleApyBps, flexibleEnabled);
     }
 
     function addTerm(uint8 termMonths, uint256 multiplierBps) external onlyOwner {
-        require(termMonths > 0, "BiliquidVIPCard: term must be >0");
-        require(!_isValidTerm(termMonths), "BiliquidVIPCard: term exists");
+        if (termMonths == 0) revert TermMustBePositive();
+        if (_isValidTerm(termMonths)) revert TermExists();
         _addTerm(termMonths, multiplierBps);
     }
 
@@ -678,11 +689,11 @@ contract BiliquidVIPCard is
                 return;
             }
         }
-        revert("BiliquidVIPCard: term not found");
+        revert TermNotFound();
     }
 
     function setTermMultiplier(uint8 termMonths, uint256 multiplierBps) external onlyOwner {
-        require(_isValidTerm(termMonths), "BiliquidVIPCard: term not found");
+        if (!_isValidTerm(termMonths)) revert TermNotFound();
         termMultiplierBps[termMonths] = multiplierBps;
     }
 
@@ -691,10 +702,7 @@ contract BiliquidVIPCard is
         memberFlexibleApyBps  = apyBps;
     }
 
-    function setReferralRates(
-        uint256 direct_, uint256 indirect_, uint256 nodeBoost_,
-        uint256 superNode_, uint256 generalAgent_
-    ) external onlyOwner {
+    function setReferralRates(uint256 direct_, uint256 indirect_, uint256 nodeBoost_, uint256 superNode_, uint256 generalAgent_) external onlyOwner {
         directReferralBps   = direct_;
         indirectReferralBps = indirect_;
         nodeBoostBps        = nodeBoost_;
@@ -702,19 +710,34 @@ contract BiliquidVIPCard is
         generalAgentBps     = generalAgent_;
     }
 
+    function setMinter(address wallet, bool enabled) external onlyOwner {
+        minters[wallet] = enabled;
+    }
+
     function setUri(string calldata newUri) external onlyOwner { uri = newUri; }
     function setUsdc(address _usdc)         external onlyOwner { usdc = IERC20(_usdc); }
     function setTreasury(address _treasury) external onlyOwner { treasury = _treasury; }
     function setPaused(bool _paused)        external onlyOwner { paused = _paused; }
 
-    /// @notice Withdraw any ERC-20 to `treasury`.
     function withdrawToTreasury(address token, uint256 amount) external onlyOwner {
-        require(IERC20(token).transfer(treasury, amount), "BiliquidVIPCard: withdraw failed");
+        if (!IERC20(token).transfer(treasury, amount)) revert WithdrawFailed();
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
     //  INTERNAL HELPERS
     // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @dev Continuously accrued interest. Updates lastClaimAt before transfer.
+    function _settleAndPay(uint8 tier, uint256 serial, address to) internal returns (uint256 interest) {
+        Position storage p = positions[tier][serial];
+        interest = p.usdcPrincipal * p.snapshotApyBps * (block.timestamp - p.lastClaimAt)
+                   / (10_000 * 365 days);
+        p.lastClaimAt = block.timestamp;
+        if (interest > 0) {
+            if (!usdc.transfer(to, interest)) revert InterestTransferFailed();
+            emit MemberInterestClaimed(to, tier, serial, interest);
+        }
+    }
 
     function _assignCard(address to, uint8 tier, uint256 serial) internal {
         cardOwner[tier][serial] = to;
@@ -725,24 +748,19 @@ contract BiliquidVIPCard is
     }
 
     function _transferCard(address from, address to, uint8 tier, uint256 serial) internal {
-        // O(1) removal from `from` list via swap-and-pop
         uint256[] storage fromList = _ownedSerials[from][tier];
         uint256 idx        = _ownedSerialIndex[tier][serial];
         uint256 lastSerial = fromList[fromList.length - 1];
-        fromList[idx]                       = lastSerial;
-        _ownedSerialIndex[tier][lastSerial]  = idx;
+        fromList[idx]                      = lastSerial;
+        _ownedSerialIndex[tier][lastSerial] = idx;
         fromList.pop();
-
-        // Append to `to` list
         _ownedSerialIndex[tier][serial] = _ownedSerials[to][tier].length;
         _ownedSerials[to][tier].push(serial);
-
         cardOwner[tier][serial] = to;
         _balances[from][tier]--;
         _balances[to][tier]++;
-
         emit TransferSingle(msg.sender, from, to, tier, 1);
-        emit CardTransferred(from, to, tier, serial);
+        if (to != address(0)) emit CardTransferred(from, to, tier, serial);
     }
 
     function _addTerm(uint8 termMonths, uint256 multiplierBps) internal {
@@ -759,82 +777,59 @@ contract BiliquidVIPCard is
     }
 
     function _requireValidTier(uint8 tier) internal pure {
-        require(tier >= GOLD && tier <= BLACK, "BiliquidVIPCard: invalid tier");
+        if (tier < GOLD || tier > BLACK) revert InvalidTier();
     }
 
-    function _requireActive(address wallet, uint256 stakeId)
-        internal view returns (StakeRecord storage rec)
-    {
-        require(stakeId < stakeRecords[wallet].length, "BiliquidVIPCard: invalid stakeId");
+    function _requireActive(address wallet, uint256 stakeId) internal view returns (StakeRecord storage rec) {
+        if (stakeId >= stakeRecords[wallet].length) revert InvalidStakeId();
         rec = stakeRecords[wallet][stakeId];
-        require(rec.active, "BiliquidVIPCard: position not active");
+        if (!rec.active) revert PositionNotActive();
     }
 
     function _memberTermParams(uint256 baseApyBps, uint8 termMonths)
         internal view returns (bool isFlexible_, uint256 snapshotApy, uint256 lockSeconds)
     {
         if (termMonths == 0) {
-            require(memberFlexibleEnabled, "BiliquidVIPCard: flexible staking disabled");
-            isFlexible_  = true;
-            snapshotApy  = memberFlexibleApyBps;
-            lockSeconds  = 0;
+            if (!memberFlexibleEnabled) revert FlexibleStakingDisabled();
+            isFlexible_ = true;
+            snapshotApy = memberFlexibleApyBps;
+            lockSeconds = 0;
         } else {
-            require(_isValidTerm(termMonths), "BiliquidVIPCard: invalid term");
-            isFlexible_  = false;
-            snapshotApy  = baseApyBps * termMultiplierBps[termMonths] / 10_000;
-            lockSeconds  = uint256(termMonths) * SECONDS_PER_MONTH;
+            if (!_isValidTerm(termMonths)) revert InvalidTerm();
+            isFlexible_ = false;
+            snapshotApy = baseApyBps * termMultiplierBps[termMonths] / 10_000;
+            lockSeconds = uint256(termMonths) * SECONDS_PER_MONTH;
         }
     }
 
     function _dailyInterest(StakeRecord storage rec) internal view returns (uint256) {
-        // interest per day = principal x APY / (10_000 x 365)
         return rec.usdcAmount * rec.snapshotApyBps / (10_000 * 365);
     }
 
-    function _claimInterest(address wallet, uint256 stakeId, StakeRecord storage rec) internal {
+    function _claimInterestLegacy(address wallet, uint256 stakeId, StakeRecord storage rec) internal {
         uint256 monthsPast = (block.timestamp - rec.lastClaimAt) / SECONDS_PER_MONTH;
         if (monthsPast == 0) return;
-
         uint256 daysPast = monthsPast * 30;
         uint256 interest = _dailyInterest(rec) * daysPast;
-
-        // Advance lastClaimAt by exactly the elapsed whole months
         rec.lastClaimAt += monthsPast * SECONDS_PER_MONTH;
-
-        if (interest > 0) {
-            require(usdc.transfer(wallet, interest), "BiliquidVIPCard: interest transfer failed");
-        }
+        if (interest > 0) { if (!usdc.transfer(wallet, interest)) revert InterestTransferFailed(); }
         emit InterestClaimed(wallet, stakeId, interest, daysPast);
     }
 
     function _distributeReferralRewards(address buyer, uint256 totalUsdc) internal {
         address l1 = referrerOf[buyer];
         if (l1 == address(0)) return;
-
         _payReferral(l1, buyer, _bps(totalUsdc, directReferralBps), "direct");
-
-        uint8 r1 = roleOf[l1];
-        if (r1 >= ROLE_NODE) {
-            _payReferral(l1, buyer, _bps(totalUsdc, nodeBoostBps), "node_boost");
-        }
-
+        if (roleOf[l1] >= ROLE_NODE) { _payReferral(l1, buyer, _bps(totalUsdc, nodeBoostBps), "node_boost"); }
         address l2 = referrerOf[l1];
         if (l2 == address(0)) return;
         _payReferral(l2, buyer, _bps(totalUsdc, indirectReferralBps), "indirect");
-
-        bool snPaid = false;
-        bool gaPaid = false;
+        bool snPaid = false; bool gaPaid = false;
         address cur = referrerOf[l2];
         while (cur != address(0) && !(snPaid && gaPaid)) {
             uint8 r = roleOf[cur];
-            if (!snPaid && r >= ROLE_SUPERNODE) {
-                _payReferral(cur, buyer, _bps(totalUsdc, superNodeBps), "supernode");
-                snPaid = true;
-            }
-            if (!gaPaid && r >= ROLE_GENERAL_AGENT) {
-                _payReferral(cur, buyer, _bps(totalUsdc, generalAgentBps), "general_agent");
-                gaPaid = true;
-            }
+            if (!snPaid && r >= ROLE_SUPERNODE)     { _payReferral(cur, buyer, _bps(totalUsdc, superNodeBps),     "supernode");     snPaid = true; }
+            if (!gaPaid && r >= ROLE_GENERAL_AGENT) { _payReferral(cur, buyer, _bps(totalUsdc, generalAgentBps), "general_agent"); gaPaid = true; }
             cur = referrerOf[cur];
         }
     }
