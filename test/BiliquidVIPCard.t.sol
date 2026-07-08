@@ -655,6 +655,7 @@ contract BiliquidVIPCardTest is Test {
     // ═══════════════════════════════════════════════════════════════════════════
 
     function test_referral_directReward() public {
+        vm.prank(owner_); card.setReferralEnabled(true); // v8: on-chain payout is opt-in
         // bob registers, alice is referrer
         vm.prank(alice); card.register(address(0));
         vm.prank(bob);   card.register(alice);
@@ -668,6 +669,7 @@ contract BiliquidVIPCardTest is Test {
     }
 
     function test_referral_indirectReward() public {
+        vm.prank(owner_); card.setReferralEnabled(true); // v8: on-chain payout is opt-in
         vm.prank(alice); card.register(address(0));
         vm.prank(bob);   card.register(alice);
         vm.prank(carol); card.register(bob);
@@ -1023,5 +1025,41 @@ contract BiliquidVIPCardTest is Test {
         vm.prank(alice);
         vm.expectRevert(BiliquidVIPCard.SynthTierInvalid.selector);
         card.synthesizeCard(diamond, four);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  v8: ON-CHAIN REFERRAL KILL-SWITCH
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_v8_referralDisabledByDefault() public view {
+        assertEq(card.onChainReferralEnabled(), false, "referral off by default after upgrade");
+    }
+
+    function test_v8_mintWithReferral_noPayoutWhenDisabled() public {
+        vm.prank(alice); card.register(address(0));
+        vm.prank(bob);   card.register(alice);
+
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        vm.prank(bob); card.mintCard(1, 1); // would pay alice 10% if enabled
+        assertEq(usdc.balanceOf(alice), aliceBefore, "no on-chain referral USDC when disabled");
+    }
+
+    function test_v8_mintWithReferral_paysWhenEnabled() public {
+        vm.prank(alice); card.register(address(0));
+        vm.prank(bob);   card.register(alice);
+
+        vm.prank(owner_); card.setReferralEnabled(true);
+        assertEq(card.onChainReferralEnabled(), true);
+
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        vm.prank(bob); card.mintCard(1, 1);
+        // 10% of 30 USDC = 3 USDC direct referral
+        assertEq(usdc.balanceOf(alice), aliceBefore + 3_000_000, "alice gets 10% when enabled");
+    }
+
+    function test_v8_setReferralEnabled_onlyOwner() public {
+        vm.prank(alice);
+        vm.expectRevert();
+        card.setReferralEnabled(true);
     }
 }

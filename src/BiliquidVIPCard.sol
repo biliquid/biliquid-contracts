@@ -152,6 +152,13 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     mapping(address => mapping(uint8 => uint256[])) private _lockedSerials;
     mapping(uint8 => mapping(uint256 => uint256))   private _lockedSerialIndex;
 
+    // ─── On-chain referral kill-switch (v8) ────────────────────────────────────
+    //  Referral commissions moved OFF-CHAIN (accumulated in backend, claimed via
+    //  CumulativeMerkleDistributor). This flag gates the legacy on-chain payout in
+    //  mintCard so it cannot double-pay. Defaults to false on a fresh storage slot,
+    //  so after the upgrade on-chain referral is DISABLED until explicitly re-enabled.
+    bool public onChainReferralEnabled;
+
     // ─── Events ───────────────────────────────────────────────────────────────
     event Registered      (address indexed wallet, address indexed referrer, uint8 role);
     event CardMinted      (address indexed to, uint8 indexed tier, uint256 serial);
@@ -184,6 +191,7 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     event TierUpdated     (uint8 tier);
     event TermAdded       (uint8 termMonths, uint256 multiplierBps);
     event TermRemoved     (uint8 termMonths);
+    event ReferralEnabledSet(bool enabled);
 
     // ─── Custom errors ────────────────────────────────────────────────────────
     error Reentrant();
@@ -320,7 +328,7 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
             _assignCard(msg.sender, tier, serial);
             emit CardMinted(msg.sender, tier, serial);
         }
-        _distributeReferralRewards(msg.sender, totalCost);
+        if (onChainReferralEnabled) _distributeReferralRewards(msg.sender, totalCost);
     }
 
     function adminMintToPool(uint8 tier, uint256 amount) external onlyOwner {
@@ -721,6 +729,14 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         nodeBoostBps        = nodeBoost_;
         superNodeBps        = superNode_;
         generalAgentBps     = generalAgent_;
+    }
+
+    /// @notice Toggle the legacy on-chain referral payout in mintCard.
+    ///         Commissions are handled off-chain (Merkle claim) by default, so this
+    ///         stays false. Only enable if reverting to on-chain distribution.
+    function setReferralEnabled(bool enabled) external onlyOwner {
+        onChainReferralEnabled = enabled;
+        emit ReferralEnabledSet(enabled);
     }
 
     function setMinter(address wallet, bool enabled) external onlyOwner {
