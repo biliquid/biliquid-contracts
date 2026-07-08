@@ -63,7 +63,7 @@ contract Upgrade is Script {
     function run() external {
         address proxy = vm.envOr(
             "PROXY_ADDRESS",
-            address(0xfE73547Ef451d9b6CeD7e0FBf400F10a2C5EAE17)  // BiliquidVIPCard proxy on Base Sepolia
+            address(0xcA5f800517B751bfCFFAB67C763bf18dD5CDCDEB)  // BiliquidVIPCard proxy on Base Sepolia
         );
         // Fresh deploy — no re-initializer needed. Pass empty bytes by default.
         bytes memory callData = vm.envOr("CALL_DATA", new bytes(0));
