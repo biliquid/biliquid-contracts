@@ -61,15 +61,22 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     uint8 public constant ROLE_SUPERNODE     = 2;
     uint8 public constant ROLE_GENERAL_AGENT = 3;
 
+    // @deprecated — referral moved off-chain
     mapping(address => address) public referrerOf;
     mapping(address => uint8)   public roleOf;
+    // @deprecated — referral moved off-chain
     mapping(address => uint256) public registrationDepth;
     uint256 public constant MAX_REFERRAL_DEPTH = 20;
 
+    // @deprecated — referral moved off-chain
     uint256 public directReferralBps;
+    // @deprecated — referral moved off-chain
     uint256 public indirectReferralBps;
+    // @deprecated — referral moved off-chain
     uint256 public nodeBoostBps;
+    // @deprecated — referral moved off-chain
     uint256 public superNodeBps;
+    // @deprecated — referral moved off-chain
     uint256 public generalAgentBps;
 
     // ─── Tier config ──────────────────────────────────────────────────────────
@@ -152,11 +159,7 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     mapping(address => mapping(uint8 => uint256[])) private _lockedSerials;
     mapping(uint8 => mapping(uint256 => uint256))   private _lockedSerialIndex;
 
-    // ─── On-chain referral kill-switch (v8) ────────────────────────────────────
-    //  Referral commissions moved OFF-CHAIN (accumulated in backend, claimed via
-    //  CumulativeMerkleDistributor). This flag gates the legacy on-chain payout in
-    //  mintCard so it cannot double-pay. Defaults to false on a fresh storage slot,
-    //  so after the upgrade on-chain referral is DISABLED until explicitly re-enabled.
+    // @deprecated — referral moved off-chain
     bool public onChainReferralEnabled;
 
     // ─── Events ───────────────────────────────────────────────────────────────
@@ -187,19 +190,13 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
                            uint256 snapshotApyBps, uint256 unlockedAt);
     event Unstaked        (address indexed staker, uint256 indexed stakeId);
     event InterestClaimed (address indexed staker, uint256 indexed stakeId, uint256 usdcAmount, uint256 daysAccrued);
-    event ReferralReward  (address indexed recipient, address indexed buyer, uint256 usdcAmt, string reason);
     event TierUpdated     (uint8 tier);
     event TermAdded       (uint8 termMonths, uint256 multiplierBps);
     event TermRemoved     (uint8 termMonths);
-    event ReferralEnabledSet(bool enabled);
 
     // ─── Custom errors ────────────────────────────────────────────────────────
     error Reentrant();
     error Paused();
-    error AlreadyRegistered();
-    error SelfRefer();
-    error ReferrerNotRegistered();
-    error ChainTooDeep();
     error InvalidRole();
     error ZeroAmount();
     error MintCapReached();
@@ -287,28 +284,13 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     function _authorizeUpgrade(address) internal override onlyOwner {}
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  REGISTRATION
+    //  ROLE MANAGEMENT
     // ═══════════════════════════════════════════════════════════════════════════
-
-    function register(address referrer) external {
-        if (registrationDepth[msg.sender] != 0) revert AlreadyRegistered();
-        if (referrer == address(0)) {
-            registrationDepth[msg.sender] = 1;
-        } else {
-            if (referrer == msg.sender) revert SelfRefer();
-            uint256 d = registrationDepth[referrer];
-            if (d == 0) revert ReferrerNotRegistered();
-            if (d >= MAX_REFERRAL_DEPTH) revert ChainTooDeep();
-            registrationDepth[msg.sender] = d + 1;
-            referrerOf[msg.sender] = referrer;
-        }
-        emit Registered(msg.sender, referrer, roleOf[msg.sender]);
-    }
 
     function setRole(address wallet, uint8 role) external onlyOwner {
         if (role > ROLE_GENERAL_AGENT) revert InvalidRole();
         roleOf[wallet] = role;
-        emit Registered(wallet, referrerOf[wallet], role);
+        emit Registered(wallet, address(0), role);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -328,7 +310,6 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
             _assignCard(msg.sender, tier, serial);
             emit CardMinted(msg.sender, tier, serial);
         }
-        if (onChainReferralEnabled) _distributeReferralRewards(msg.sender, totalCost);
     }
 
     function adminMintToPool(uint8 tier, uint256 amount) external onlyOwner {
@@ -723,22 +704,6 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         memberFlexibleApyBps  = apyBps;
     }
 
-    function setReferralRates(uint256 direct_, uint256 indirect_, uint256 nodeBoost_, uint256 superNode_, uint256 generalAgent_) external onlyOwner {
-        directReferralBps   = direct_;
-        indirectReferralBps = indirect_;
-        nodeBoostBps        = nodeBoost_;
-        superNodeBps        = superNode_;
-        generalAgentBps     = generalAgent_;
-    }
-
-    /// @notice Toggle the legacy on-chain referral payout in mintCard.
-    ///         Commissions are handled off-chain (Merkle claim) by default, so this
-    ///         stays false. Only enable if reverting to on-chain distribution.
-    function setReferralEnabled(bool enabled) external onlyOwner {
-        onChainReferralEnabled = enabled;
-        emit ReferralEnabledSet(enabled);
-    }
-
     function setMinter(address wallet, bool enabled) external onlyOwner {
         minters[wallet] = enabled;
     }
@@ -858,30 +823,4 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         emit InterestClaimed(wallet, stakeId, interest, daysPast);
     }
 
-    function _distributeReferralRewards(address buyer, uint256 totalUsdc) internal {
-        address l1 = referrerOf[buyer];
-        if (l1 == address(0)) return;
-        _payReferral(l1, buyer, _bps(totalUsdc, directReferralBps), "direct");
-        if (roleOf[l1] >= ROLE_NODE) { _payReferral(l1, buyer, _bps(totalUsdc, nodeBoostBps), "node_boost"); }
-        address l2 = referrerOf[l1];
-        if (l2 == address(0)) return;
-        _payReferral(l2, buyer, _bps(totalUsdc, indirectReferralBps), "indirect");
-        bool snPaid = false; bool gaPaid = false;
-        address cur = referrerOf[l2];
-        while (cur != address(0) && !(snPaid && gaPaid)) {
-            uint8 r = roleOf[cur];
-            if (!snPaid && r >= ROLE_SUPERNODE)     { _payReferral(cur, buyer, _bps(totalUsdc, superNodeBps),     "supernode");     snPaid = true; }
-            if (!gaPaid && r >= ROLE_GENERAL_AGENT) { _payReferral(cur, buyer, _bps(totalUsdc, generalAgentBps), "general_agent"); gaPaid = true; }
-            cur = referrerOf[cur];
-        }
-    }
-
-    function _payReferral(address recipient, address buyer, uint256 usdcAmt, string memory reason) internal {
-        if (usdcAmt > 0) usdc.transfer(recipient, usdcAmt);
-        emit ReferralReward(recipient, buyer, usdcAmt, reason);
-    }
-
-    function _bps(uint256 amount, uint256 rate) internal pure returns (uint256) {
-        return amount * rate / 10_000;
-    }
 }
