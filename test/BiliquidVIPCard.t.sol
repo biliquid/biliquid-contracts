@@ -425,7 +425,7 @@ contract BiliquidVIPCardTest is Test {
         vm.prank(alice); card.openPosition(1, serial, 3, 100_000_000);
 
         vm.prank(alice);
-        vm.expectRevert(BiliquidVIPCard.CloseV6First.selector);
+        vm.expectRevert(BiliquidVIPCard.PositionStillOpen.selector);
         card.unlockCard(1, serial);
     }
 
@@ -629,13 +629,14 @@ contract BiliquidVIPCardTest is Test {
     }
 
     function test_nonMember_flexible_disabled_reverts() public {
+        vm.prank(owner_); card.setNonMemberConfig(NON_MEMBER_AMOUNT, 300, 300, false);
         vm.prank(bob);
         vm.expectRevert(BiliquidVIPCard.NonMemberFlexibleDisabled.selector);
         card.stakeNonMember(0);
     }
 
     function test_nonMember_flexible_enabled() public {
-        vm.prank(owner_); card.setNonMemberConfig(NON_MEMBER_AMOUNT, 300, 300, true);
+        // flexibleEnabled is true by default in initialize(); no need to set it
         vm.prank(bob); card.stakeNonMember(0);
         BiliquidVIPCard.StakeRecord[] memory recs = card.getStakeRecords(bob);
         assertTrue(recs[0].isFlexible);

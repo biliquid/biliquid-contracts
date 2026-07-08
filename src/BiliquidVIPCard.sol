@@ -216,6 +216,7 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     error MustUpgradeToLonger();
     error NoUsdcDeposited();
     error ClaimOncePer30Days();
+    error ClaimTooSoon();
     error LengthMismatch();
     error TermMustBePositive();
     error TermExists();
@@ -487,15 +488,18 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     }
 
     /// @notice Settle and pay all accrued interest for one position.
+    ///         Enforces a 1-day minimum interval since lastClaimAt (or openedAt).
     function claimMemberInterest(uint8 tier, uint256 serial) external nonReentrant {
         _requireValidTier(tier);
         if (lockedBy[tier][serial] != msg.sender) revert NotCardLocker();
         Position storage p = positions[tier][serial];
         if (!p.active) revert NoActivePosition();
+        if (block.timestamp < p.lastClaimAt + SECONDS_PER_DAY) revert ClaimTooSoon();
         _settleAndPay(tier, serial, msg.sender);
     }
 
     /// @notice Claim accrued interest for ALL active member positions of caller.
+    ///         Silently skips positions whose 1-day cooldown has not elapsed yet.
     function claimAllInterest() external nonReentrant {
         uint8[4] memory tiers_ = [GOLD, PLATINUM, DIAMOND, BLACK];
         for (uint256 t = 0; t < 4; t++) {
@@ -504,7 +508,8 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
             uint256 len = ls.length;
             for (uint256 i = 0; i < len; i++) {
                 uint256 serial = ls[i];
-                if (positions[tier][serial].active) {
+                Position storage p = positions[tier][serial];
+                if (p.active && block.timestamp >= p.lastClaimAt + SECONDS_PER_DAY) {
                     _settleAndPay(tier, serial, msg.sender);
                 }
             }
