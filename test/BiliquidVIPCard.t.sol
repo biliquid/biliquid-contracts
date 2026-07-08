@@ -526,10 +526,11 @@ contract BiliquidVIPCardTest is Test {
         uint256 before = usdc.balanceOf(alice);
         vm.prank(alice); card.partialWithdraw(1, serial, 100_000_000);
 
-        // partialWithdraw settles accrued interest first, then returns the withdrawn principal
+        // partialWithdraw accrues interest to claimableAmount, only returns the withdrawn principal
         uint256 interest = amount * 900 * elapsed / (10_000 * 365 days);
-        assertEq(usdc.balanceOf(alice) - before, 100_000_000 + interest, "partial + interest");
+        assertEq(usdc.balanceOf(alice) - before, 100_000_000, "partial: only principal returned");
         assertEq(card.getPosition(1, serial).usdcPrincipal, 100_000_000, "principal reduced");
+        assertEq(card.pendingMemberInterest(1, serial), interest, "interest in claimableAmount");
     }
 
     function test_v6_partialWithdraw_beforeExpiry_reverts() public {

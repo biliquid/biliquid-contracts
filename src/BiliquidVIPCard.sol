@@ -144,6 +144,7 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         uint256  openedAt;
         uint256  unlockedAt;
         uint256  lastClaimAt;
+        uint256  claimableAmount; // accrued but not yet paid (from addToPosition / partialWithdraw / upgradeTerms)
     }
     mapping(uint8 => mapping(uint256 => Position)) public positions;
 
@@ -160,10 +161,10 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     event CardUnlocked    (address indexed locker, uint8 indexed tier, uint256 indexed serial);
     event CardSynthesized (address indexed user, uint8 fromTier, uint8 toTier, uint256 newSerial);
 
-    event PositionOpenedV2     (address indexed staker, uint8 indexed tier, uint256 indexed serial,
+    event PositionOpened       (address indexed staker, uint8 indexed tier, uint256 indexed serial,
                                 uint8 termMonths, bool isFlexible,
                                 uint256 amount, uint256 snapshotApyBps, uint256 unlockedAt);
-    event PositionClosedV2     (address indexed staker, uint8 indexed tier, uint256 indexed serial,
+    event PositionClosed       (address indexed staker, uint8 indexed tier, uint256 indexed serial,
                                 uint256 principalReturned, uint256 interestPaid);
     event AmountAdded          (address indexed staker, uint8 indexed tier, uint256 indexed serial,
                                 uint256 amount, uint256 newTotal);
@@ -219,7 +220,7 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     error TermMustBePositive();
     error TermExists();
     error TermNotFound();
-    error CloseV6First();
+    error PositionStillOpen();
     error PrincipalReturnFailed();
     error UseNonMemberUnstake();
     error UsdcReturnFailed();
@@ -269,7 +270,7 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         tierConfigs[DIAMOND]  = TierConfig({ mintPrice: 480_000_000,   maxStakeAmountUsdc: 8_500_000_000,  apyBps: 1100, mintCap:  10_000 });
         tierConfigs[BLACK]    = TierConfig({ mintPrice: 1_920_000_000, maxStakeAmountUsdc: 80_000_000_000, apyBps: 1250, mintCap:   2_500 });
 
-        nonMemberConfig = NonMemberConfig({ stakeAmountUsdc: 100_000_000, baseApyBps: 300, flexibleApyBps: 300, flexibleEnabled: false });
+        nonMemberConfig = NonMemberConfig({ stakeAmountUsdc: 100_000_000, baseApyBps: 300, flexibleApyBps: 300, flexibleEnabled: true });
 
         nextSerial[GOLD] = nextSerial[PLATINUM] = nextSerial[DIAMOND] = nextSerial[BLACK] = 1;
     }
@@ -411,20 +412,21 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         uint256 unlock_ = isFlexible_ ? 0 : now_ + lockSeconds;
 
         positions[tier][cardSerial] = Position({
-            active:         true,
-            isFlexible:     isFlexible_,
-            termMonths:     termMonths,
-            usdcPrincipal:  amount,
-            snapshotApyBps: snapshotApy,
-            openedAt:       now_,
-            unlockedAt:     unlock_,
-            lastClaimAt:    now_
+            active:          true,
+            isFlexible:      isFlexible_,
+            termMonths:      termMonths,
+            usdcPrincipal:   amount,
+            snapshotApyBps:  snapshotApy,
+            openedAt:        now_,
+            unlockedAt:      unlock_,
+            lastClaimAt:     now_,
+            claimableAmount: 0
         });
 
-        emit PositionOpenedV2(msg.sender, tier, cardSerial, termMonths, isFlexible_, amount, snapshotApy, unlock_);
+        emit PositionOpened(msg.sender, tier, cardSerial, termMonths, isFlexible_, amount, snapshotApy, unlock_);
     }
 
-    /// @notice Add USDC to an active position. Settles accrued interest first.
+    /// @notice Add USDC to an active position. Accrues interest (does not pay out).
     function addToPosition(uint8 tier, uint256 serial, uint256 amount) external notPaused nonReentrant {
         _requireValidTier(tier);
         if (lockedBy[tier][serial] != msg.sender) revert NotCardLocker();
@@ -434,14 +436,14 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         TierConfig storage cfg = tierConfigs[tier];
         if (p.usdcPrincipal + amount > cfg.maxStakeAmountUsdc) revert ExceedsCardCapacity();
 
-        _settleAndPay(tier, serial, msg.sender);
+        _settleAndAccrue(tier, serial);
         if (!usdc.transferFrom(msg.sender, address(this), amount)) revert UsdcTransferFailed();
         p.usdcPrincipal += amount;
 
         emit AmountAdded(msg.sender, tier, serial, amount, p.usdcPrincipal);
     }
 
-    /// @notice Reduce principal. Settles accrued interest first.
+    /// @notice Reduce principal. Accrues interest (does not pay out).
     ///         Flexible: any time. Fixed-term: post-expiry only.
     function partialWithdraw(uint8 tier, uint256 serial, uint256 amount) external notPaused nonReentrant {
         _requireValidTier(tier);
@@ -452,14 +454,14 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         if (amount >= p.usdcPrincipal) revert UseClosePosition();
         if (!p.isFlexible && block.timestamp < p.unlockedAt) revert StillLocked();
 
-        _settleAndPay(tier, serial, msg.sender);
+        _settleAndAccrue(tier, serial);
         p.usdcPrincipal -= amount;
         if (!usdc.transfer(msg.sender, amount)) revert WithdrawFailed();
 
         emit PartialWithdrawn(msg.sender, tier, serial, amount, p.usdcPrincipal);
     }
 
-    /// @notice Upgrade a fixed-term to a longer term. Settles accrued interest first.
+    /// @notice Upgrade a fixed-term to a longer term. Accrues interest (does not pay out).
     ///         New APY = baseApy * termMultiplier[newTerm].
     ///         New unlock = openedAt + newTermMonths*30d (anchored to open time).
     function upgradeTerms(uint8 tier, uint256 serial, uint8 newTermMonths) external notPaused nonReentrant {
@@ -471,7 +473,7 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         if (!_isValidTerm(newTermMonths)) revert InvalidTerm();
         if (newTermMonths <= p.termMonths) revert MustUpgradeToLonger();
 
-        _settleAndPay(tier, serial, msg.sender);
+        _settleAndAccrue(tier, serial);
 
         TierConfig storage cfg = tierConfigs[tier];
         uint256 newApy      = cfg.apyBps * termMultiplierBps[newTermMonths] / 10_000;
@@ -525,14 +527,14 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         p.usdcPrincipal = 0;
 
         if (!usdc.transfer(msg.sender, principal)) revert PrincipalReturnFailed();
-        emit PositionClosedV2(msg.sender, tier, serial, principal, interest);
+        emit PositionClosed(msg.sender, tier, serial, principal, interest);
     }
 
     /// @notice Return the locked card to the caller's wallet.
     ///         Requires: position must be closed first.
     function unlockCard(uint8 tier, uint256 cardSerial) external nonReentrant {
         if (lockedBy[tier][cardSerial] != msg.sender) revert NotCardLocker();
-        if (positions[tier][cardSerial].active) revert CloseV6First();
+        if (positions[tier][cardSerial].active) revert PositionStillOpen();
 
         lockedBy[tier][cardSerial]   = address(0);
         cardStaked[tier][cardSerial] = false;
@@ -627,7 +629,8 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     function pendingMemberInterest(uint8 tier, uint256 serial) external view returns (uint256) {
         Position storage p = positions[tier][serial];
         if (!p.active || p.usdcPrincipal == 0) return 0;
-        return p.usdcPrincipal * p.snapshotApyBps * (block.timestamp - p.lastClaimAt) / (10_000 * 365 days);
+        uint256 accrued = p.usdcPrincipal * p.snapshotApyBps * (block.timestamp - p.lastClaimAt) / (10_000 * 365 days);
+        return p.claimableAmount + accrued;
     }
 
     function getValidTerms() external view returns (uint8[] memory) { return validTerms; }
@@ -727,12 +730,25 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     //  INTERNAL HELPERS
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// @dev Continuously accrued interest. Updates lastClaimAt before transfer.
+    /// @dev Accrue interest into claimableAmount without paying out.
+    ///      Used by addToPosition / partialWithdraw / upgradeTerms so that
+    ///      principal changes reset the accrual window without forcing a claim.
+    function _settleAndAccrue(uint8 tier, uint256 serial) internal {
+        Position storage p = positions[tier][serial];
+        uint256 accrued = p.usdcPrincipal * p.snapshotApyBps * (block.timestamp - p.lastClaimAt)
+                          / (10_000 * 365 days);
+        p.lastClaimAt = block.timestamp;
+        if (accrued > 0) p.claimableAmount += accrued;
+    }
+
+    /// @dev Pay out claimableAmount + newly accrued interest. Used by claim / close.
     function _settleAndPay(uint8 tier, uint256 serial, address to) internal returns (uint256 interest) {
         Position storage p = positions[tier][serial];
-        interest = p.usdcPrincipal * p.snapshotApyBps * (block.timestamp - p.lastClaimAt)
-                   / (10_000 * 365 days);
+        uint256 accrued = p.usdcPrincipal * p.snapshotApyBps * (block.timestamp - p.lastClaimAt)
+                          / (10_000 * 365 days);
         p.lastClaimAt = block.timestamp;
+        interest = p.claimableAmount + accrued;
+        p.claimableAmount = 0;
         if (interest > 0) {
             if (!usdc.transfer(to, interest)) revert InterestTransferFailed();
             emit MemberInterestClaimed(to, tier, serial, interest);
