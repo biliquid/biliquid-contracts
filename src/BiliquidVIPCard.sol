@@ -14,7 +14,7 @@ pragma solidity ^0.8.24;
  *   Non-member: monthly accrual     — _claimInterestLegacy (30-day buckets)
  *
  * ── Card Synthesis ────────────────────────────────────────────────────────────
- *   Gold×4 → Platinum, Platinum×4 → Diamond, Diamond×4 → Black (no USDC cost)
+ *   Gold×4 → Platinum, Platinum×4 → Diamond, Diamond×6 → Black (no USDC cost)
  *
  * ── Upgradeability ────────────────────────────────────────────────────────────
  *   UUPS proxy. This is a FRESH DEPLOY — no legacy storage compatibility needed.
@@ -351,20 +351,25 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     //  CARD SYNTHESIS
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// @notice Synthesize 4 cards of `fromTier` into 1 card of the next tier.
-    ///         All 4 serials must be distinct, owned by caller, and unlocked (no USDC cost).
-    ///         Interleaved check+burn prevents duplicate-serial exploits.
-    function synthesizeCard(uint8 fromTier, uint256 s0, uint256 s1, uint256 s2, uint256 s3)
+    /// @notice Synthesize cards of `fromTier` into 1 card of the next tier.
+    ///         Gold/Platinum → next tier requires 4 input cards.
+    ///         Diamond → Black requires 6 input cards.
+    ///         All serials must be distinct, owned by caller, and unlocked (no USDC cost).
+    function synthesizeCard(uint8 fromTier, uint256[] calldata serials)
         external notPaused nonReentrant
     {
         if (fromTier < GOLD || fromTier >= BLACK) revert SynthTierInvalid();
+        uint256 required = fromTier == DIAMOND ? 6 : 4;
+        if (serials.length != required) revert SynthTierInvalid();
         uint8 toTier = fromTier + 1;
         if (nextSerial[toTier] > tierConfigs[toTier].mintCap) revert SynthMintCap();
         address me = msg.sender;
-        if (cardOwner[fromTier][s0] != me) revert SynthNotOwner(); _transferCard(me, address(0), fromTier, s0);
-        if (cardOwner[fromTier][s1] != me) revert SynthNotOwner(); _transferCard(me, address(0), fromTier, s1);
-        if (cardOwner[fromTier][s2] != me) revert SynthNotOwner(); _transferCard(me, address(0), fromTier, s2);
-        if (cardOwner[fromTier][s3] != me) revert SynthNotOwner(); _transferCard(me, address(0), fromTier, s3);
+        // Interleaved check+burn prevents duplicate-serial exploits
+        for (uint256 i = 0; i < required; ) {
+            if (cardOwner[fromTier][serials[i]] != me) revert SynthNotOwner();
+            _transferCard(me, address(0), fromTier, serials[i]);
+            unchecked { ++i; }
+        }
         uint256 newSerial = nextSerial[toTier]++;
         _assignCard(me, toTier, newSerial);
         emit CardSynthesized(me, fromTier, toTier, newSerial);

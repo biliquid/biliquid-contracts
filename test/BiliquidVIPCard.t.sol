@@ -902,7 +902,8 @@ contract BiliquidVIPCardTest is Test {
         uint256 platBefore = card.getCardsByOwner(alice, platinum).length;
         uint256 goldBefore = card.getCardsByOwner(alice, gold).length;
 
-        vm.prank(alice); card.synthesizeCard(gold, serials[0], serials[1], serials[2], serials[3]);
+        uint256[] memory s4 = serials;
+        vm.prank(alice); card.synthesizeCard(gold, s4);
 
         assertEq(card.getCardsByOwner(alice, gold).length,     goldBefore - 4);
         assertEq(card.getCardsByOwner(alice, platinum).length, platBefore + 1);
@@ -917,7 +918,7 @@ contract BiliquidVIPCardTest is Test {
         // locked card is transferred to contract, so owner check fails with SynthNotOwner
         vm.prank(alice);
         vm.expectRevert(BiliquidVIPCard.SynthNotOwner.selector);
-        card.synthesizeCard(gold, serials[0], serials[1], serials[2], serials[3]);
+        card.synthesizeCard(gold, serials);
     }
 
     function test_synthesize_rejects_not_owner() public {
@@ -926,7 +927,7 @@ contract BiliquidVIPCardTest is Test {
 
         vm.prank(bob);
         vm.expectRevert(BiliquidVIPCard.SynthNotOwner.selector);
-        card.synthesizeCard(gold, aliceSerials[0], aliceSerials[1], aliceSerials[2], aliceSerials[3]);
+        card.synthesizeCard(gold, aliceSerials);
     }
 
     function test_synthesize_rejects_duplicate_serial() public {
@@ -935,23 +936,36 @@ contract BiliquidVIPCardTest is Test {
         uint256[] memory owned = card.getCardsByOwner(alice, gold);
 
         // duplicate s0==s2: after burning s0, cardOwner[gold][s0]==address(0), so s2 check reverts
+        uint256[] memory dupes = new uint256[](4);
+        dupes[0] = owned[0]; dupes[1] = owned[1]; dupes[2] = owned[0]; dupes[3] = owned[1];
         vm.prank(alice);
         vm.expectRevert(BiliquidVIPCard.SynthNotOwner.selector);
-        card.synthesizeCard(gold, owned[0], owned[1], owned[0], owned[1]);
+        card.synthesizeCard(gold, dupes);
     }
 
     function test_synthesize_cannot_synthesize_black() public {
         uint8 black = card.BLACK();
+        uint256[] memory s = new uint256[](4);
+        s[0]=1; s[1]=2; s[2]=3; s[3]=4;
         vm.prank(alice);
         vm.expectRevert(BiliquidVIPCard.SynthTierInvalid.selector);
-        card.synthesizeCard(black, 1, 2, 3, 4);
+        card.synthesizeCard(black, s);
+    }
+
+    function test_synthesize_rejects_wrong_count() public {
+        uint8 gold = card.GOLD();
+        uint256[] memory three = new uint256[](3);
+        three[0]=1; three[1]=2; three[2]=3;
+        vm.prank(alice);
+        vm.expectRevert(BiliquidVIPCard.SynthTierInvalid.selector);
+        card.synthesizeCard(gold, three);
     }
 
     function test_synthesize_cards_burned_permanently() public {
         uint8 gold = card.GOLD();
         uint256[] memory serials = _mintFourGoldCards(alice);
 
-        vm.prank(alice); card.synthesizeCard(gold, serials[0], serials[1], serials[2], serials[3]);
+        vm.prank(alice); card.synthesizeCard(gold, serials);
 
         for (uint256 i = 0; i < serials.length; i++) {
             assertEq(card.cardOwner(gold, serials[i]), address(0));
@@ -966,14 +980,48 @@ contract BiliquidVIPCardTest is Test {
         vm.prank(alice); card.mintCard(gold, 16);
         uint256[] memory g = card.getCardsByOwner(alice, gold);
 
-        vm.prank(alice); card.synthesizeCard(gold, g[0],  g[1],  g[2],  g[3]);
-        vm.prank(alice); card.synthesizeCard(gold, g[4],  g[5],  g[6],  g[7]);
-        vm.prank(alice); card.synthesizeCard(gold, g[8],  g[9],  g[10], g[11]);
-        vm.prank(alice); card.synthesizeCard(gold, g[12], g[13], g[14], g[15]);
+        uint256[] memory g0 = new uint256[](4); g0[0]=g[0];  g0[1]=g[1];  g0[2]=g[2];  g0[3]=g[3];
+        uint256[] memory g1 = new uint256[](4); g1[0]=g[4];  g1[1]=g[5];  g1[2]=g[6];  g1[3]=g[7];
+        uint256[] memory g2 = new uint256[](4); g2[0]=g[8];  g2[1]=g[9];  g2[2]=g[10]; g2[3]=g[11];
+        uint256[] memory g3 = new uint256[](4); g3[0]=g[12]; g3[1]=g[13]; g3[2]=g[14]; g3[3]=g[15];
+        vm.prank(alice); card.synthesizeCard(gold, g0);
+        vm.prank(alice); card.synthesizeCard(gold, g1);
+        vm.prank(alice); card.synthesizeCard(gold, g2);
+        vm.prank(alice); card.synthesizeCard(gold, g3);
         assertEq(card.getCardsByOwner(alice, platinum).length, 4);
 
         uint256[] memory p = card.getCardsByOwner(alice, platinum);
-        vm.prank(alice); card.synthesizeCard(platinum, p[0], p[1], p[2], p[3]);
+        vm.prank(alice); card.synthesizeCard(platinum, p);
         assertEq(card.getCardsByOwner(alice, diamond).length, 1);
+    }
+
+    function test_synthesize_diamond_to_black_requires_6() public {
+        uint8 diamond = card.DIAMOND();
+        uint8 black   = card.BLACK();
+
+        // Mint 6 diamond cards via admin gift
+        vm.startPrank(owner_);
+        card.adminMintToPool(diamond, 6);
+        uint256[] memory pool = card.getCardsByOwner(address(card), diamond);
+        for (uint256 i = 0; i < 6; i++) {
+            card.giftCard(diamond, pool[i], alice);
+        }
+        vm.stopPrank();
+
+        uint256[] memory d = card.getCardsByOwner(alice, diamond);
+        assertEq(d.length, 6);
+
+        vm.prank(alice); card.synthesizeCard(diamond, d);
+        assertEq(card.getCardsByOwner(alice, black).length, 1);
+        assertEq(card.getCardsByOwner(alice, diamond).length, 0);
+    }
+
+    function test_synthesize_diamond_to_black_rejects_4_cards() public {
+        uint8 diamond = card.DIAMOND();
+        uint256[] memory four = new uint256[](4);
+        four[0]=1; four[1]=2; four[2]=3; four[3]=4;
+        vm.prank(alice);
+        vm.expectRevert(BiliquidVIPCard.SynthTierInvalid.selector);
+        card.synthesizeCard(diamond, four);
     }
 }
