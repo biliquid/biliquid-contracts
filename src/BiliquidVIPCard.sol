@@ -162,6 +162,9 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     // @deprecated — referral moved off-chain
     bool public onChainReferralEnabled;
 
+    // ─── Ops role (giftCard caller) ───────────────────────────────────────────
+    mapping(address => bool) public opsRole;
+
     // ─── Events ───────────────────────────────────────────────────────────────
     event Registered      (address indexed wallet, address indexed referrer, uint8 role);
     event CardMinted      (address indexed to, uint8 indexed tier, uint256 serial);
@@ -243,7 +246,8 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     error SynthMintCap();
 
     // ─── Modifiers ────────────────────────────────────────────────────────────
-    modifier notPaused() { if (paused) revert Paused(); _; }
+    modifier notPaused()   { if (paused) revert Paused(); _; }
+    modifier onlyOpsRole() { require(opsRole[msg.sender] || msg.sender == owner(), "Not ops"); _; }
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() { _disableInitializers(); }
@@ -312,20 +316,14 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         }
     }
 
-    function adminMintToPool(uint8 tier, uint256 amount) external onlyOwner {
-        _requireValidTier(tier);
-        if (amount == 0) revert ZeroAmount();
-        for (uint256 i = 0; i < amount; i++) {
-            uint256 serial = nextSerial[tier]++;
-            _assignCard(address(this), tier, serial);
-        }
-    }
-
-    function giftCard(uint8 tier, uint256 serial, address recipient) external onlyOwner {
+    /// @notice Directly mint a card of any tier and gift it to recipient.
+    ///         Caller must have opsRole. No USDC cost (free ops mint).
+    ///         Does NOT count against mintCap.
+    function giftCard(uint8 tier, address recipient) external onlyOpsRole {
         if (recipient == address(0)) revert ZeroRecipient();
-        if (cardOwner[tier][serial] != address(this)) revert NotInGiftPool();
-        if (cardStaked[tier][serial]) revert CardStaked();
-        _transferCard(address(this), recipient, tier, serial);
+        _requireValidTier(tier);
+        uint256 serial = nextSerial[tier]++;
+        _assignCard(recipient, tier, serial);
         emit CardGifted(recipient, tier, serial);
     }
 
@@ -351,7 +349,6 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         uint256 required = fromTier == DIAMOND ? 6 : 4;
         if (serials.length != required) revert SynthTierInvalid();
         uint8 toTier = fromTier + 1;
-        if (nextSerial[toTier] > tierConfigs[toTier].mintCap) revert SynthMintCap();
         address me = msg.sender;
         // Interleaved check+burn prevents duplicate-serial exploits
         for (uint256 i = 0; i < required; ) {
@@ -707,6 +704,14 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     function setMinter(address wallet, bool enabled) external onlyOwner {
         minters[wallet] = enabled;
     }
+
+    function setOpsRole(address wallet, bool enabled) external onlyOwner {
+        opsRole[wallet] = enabled;
+    }
+
+    /// @dev Deprecated — referral rates are now managed off-chain. Kept as no-op for ABI compatibility.
+    function setReferralRates(uint256, uint256, uint256, uint256, uint256) external onlyOwner {}
+
 
     function setUri(string calldata newUri) external onlyOwner { uri = newUri; }
     function setUsdc(address _usdc)         external onlyOwner { usdc = IERC20(_usdc); }

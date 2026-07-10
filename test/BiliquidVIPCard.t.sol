@@ -622,12 +622,25 @@ contract BiliquidVIPCardTest is Test {
     //  GIFT POOL
     // ═══════════════════════════════════════════════════════════════════════════
 
-    function test_adminMintToPool_andGift() public {
-        vm.prank(owner_); card.adminMintToPool(1, 1);
-        assertEq(card.cardOwner(1, 1), address(card));
+    function test_giftCard_directMint() public {
+        // giftCard now mints directly to recipient (no adminMintToPool needed)
+        uint256 serialBefore = card.nextSerial(1);
+        vm.prank(owner_); card.giftCard(1, bob);
+        assertEq(card.cardOwner(1, serialBefore), bob);
+        assertEq(card.nextSerial(1), serialBefore + 1);
+    }
 
-        vm.prank(owner_); card.giftCard(1, 1, bob);
-        assertEq(card.cardOwner(1, 1), bob);
+    function test_giftCard_opsRole() public {
+        address ops = address(0xBEEF);
+        vm.prank(owner_); card.setOpsRole(ops, true);
+        uint256 serialBefore = card.nextSerial(2);
+        vm.prank(ops); card.giftCard(2, alice);
+        assertEq(card.cardOwner(2, serialBefore), alice);
+    }
+
+    function test_giftCard_rejects_non_ops() public {
+        vm.expectRevert("Not ops");
+        vm.prank(alice); card.giftCard(1, bob);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -937,12 +950,10 @@ contract BiliquidVIPCardTest is Test {
         uint8 diamond = card.DIAMOND();
         uint8 black   = card.BLACK();
 
-        // Mint 6 diamond cards via admin gift
+        // Mint 6 diamond cards via direct giftCard
         vm.startPrank(owner_);
-        card.adminMintToPool(diamond, 6);
-        uint256[] memory pool = card.getCardsByOwner(address(card), diamond);
         for (uint256 i = 0; i < 6; i++) {
-            card.giftCard(diamond, pool[i], alice);
+            card.giftCard(diamond, alice);
         }
         vm.stopPrank();
 
