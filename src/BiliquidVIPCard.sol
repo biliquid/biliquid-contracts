@@ -55,29 +55,13 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     uint8 public constant DIAMOND  = 3;
     uint8 public constant BLACK    = 4;
 
-    // ─── Referral roles ───────────────────────────────────────────────────────
+    // ─── Referral roles (managed off-chain; roleOf written on-chain for backend reads) ─────────
     uint8 public constant ROLE_USER          = 0;
     uint8 public constant ROLE_NODE          = 1;
     uint8 public constant ROLE_SUPERNODE     = 2;
     uint8 public constant ROLE_GENERAL_AGENT = 3;
 
-    // @deprecated — referral moved off-chain
-    mapping(address => address) public referrerOf;
-    mapping(address => uint8)   public roleOf;
-    // @deprecated — referral moved off-chain
-    mapping(address => uint256) public registrationDepth;
-    uint256 public constant MAX_REFERRAL_DEPTH = 20;
-
-    // @deprecated — referral moved off-chain
-    uint256 public directReferralBps;
-    // @deprecated — referral moved off-chain
-    uint256 public indirectReferralBps;
-    // @deprecated — referral moved off-chain
-    uint256 public nodeBoostBps;
-    // @deprecated — referral moved off-chain
-    uint256 public superNodeBps;
-    // @deprecated — referral moved off-chain
-    uint256 public generalAgentBps;
+    mapping(address => uint8) public roleOf;
 
     // ─── Tier config ──────────────────────────────────────────────────────────
     struct TierConfig {
@@ -159,14 +143,11 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     mapping(address => mapping(uint8 => uint256[])) private _lockedSerials;
     mapping(uint8 => mapping(uint256 => uint256))   private _lockedSerialIndex;
 
-    // @deprecated — referral moved off-chain
-    bool public onChainReferralEnabled;
-
     // ─── Ops role (giftCard caller) ───────────────────────────────────────────
     mapping(address => bool) public opsRole;
 
     // ─── Events ───────────────────────────────────────────────────────────────
-    event Registered      (address indexed wallet, address indexed referrer, uint8 role);
+    event RoleSet         (address indexed wallet, uint8 role);
     event CardMinted      (address indexed to, uint8 indexed tier, uint256 serial);
     event CardGifted      (address indexed to, uint8 indexed tier, uint256 serial);
     event CardTransferred (address indexed from, address indexed to, uint8 tier, uint256 serial);
@@ -205,8 +186,6 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     error MintCapReached();
     error PaymentFailed();
     error ZeroRecipient();
-    error NotInGiftPool();
-    error CardStaked();
     error ZeroAddress();
     error NotOwner();
     error CardIsLocked();
@@ -231,7 +210,6 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     error TermNotFound();
     error PositionStillOpen();
     error PrincipalReturnFailed();
-    error UseNonMemberUnstake();
     error UsdcReturnFailed();
     error NonMemberFlexibleDisabled();
     error FlexibleStakingDisabled();
@@ -243,7 +221,6 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     error OnlyMinter();
     error SynthTierInvalid();
     error SynthNotOwner();
-    error SynthMintCap();
 
     // ─── Modifiers ────────────────────────────────────────────────────────────
     modifier notPaused()   { if (paused) revert Paused(); _; }
@@ -262,12 +239,6 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         usdc     = IERC20(_usdc);
         treasury = _treasury;
         uri      = "https://biliquid.io/metadata/{id}.json";
-
-        directReferralBps   = 1000;
-        indirectReferralBps =  500;
-        nodeBoostBps        =  500;
-        superNodeBps        =  500;
-        generalAgentBps     =  500;
 
         _addTerm(3,  10000);
         _addTerm(6,  13333);
@@ -294,7 +265,7 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     function setRole(address wallet, uint8 role) external onlyOwner {
         if (role > ROLE_GENERAL_AGENT) revert InvalidRole();
         roleOf[wallet] = role;
-        emit Registered(wallet, address(0), role);
+        emit RoleSet(wallet, role);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -708,10 +679,6 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     function setOpsRole(address wallet, bool enabled) external onlyOwner {
         opsRole[wallet] = enabled;
     }
-
-    /// @dev Deprecated — referral rates are now managed off-chain. Kept as no-op for ABI compatibility.
-    function setReferralRates(uint256, uint256, uint256, uint256, uint256) external onlyOwner {}
-
 
     function setUri(string calldata newUri) external onlyOwner { uri = newUri; }
     function setUsdc(address _usdc)         external onlyOwner { usdc = IERC20(_usdc); }
