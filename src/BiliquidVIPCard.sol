@@ -55,29 +55,21 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     uint8 public constant DIAMOND  = 3;
     uint8 public constant BLACK    = 4;
 
-    // ─── Referral roles ───────────────────────────────────────────────────────
+    // ─── Referral roles (managed off-chain; roleOf still written on-chain for backend reads) ──
     uint8 public constant ROLE_USER          = 0;
     uint8 public constant ROLE_NODE          = 1;
     uint8 public constant ROLE_SUPERNODE     = 2;
     uint8 public constant ROLE_GENERAL_AGENT = 3;
 
-    // @deprecated — referral moved off-chain
-    mapping(address => address) public referrerOf;
-    mapping(address => uint8)   public roleOf;
-    // @deprecated — referral moved off-chain
-    mapping(address => uint256) public registrationDepth;
-    uint256 public constant MAX_REFERRAL_DEPTH = 20;
+    mapping(address => address) private __deprecated_referrerOf;       // slot preserved — do not remove
+    mapping(address => uint8)   public  roleOf;
+    mapping(address => uint256) private __deprecated_registrationDepth; // slot preserved — do not remove
 
-    // @deprecated — referral moved off-chain
-    uint256 public directReferralBps;
-    // @deprecated — referral moved off-chain
-    uint256 public indirectReferralBps;
-    // @deprecated — referral moved off-chain
-    uint256 public nodeBoostBps;
-    // @deprecated — referral moved off-chain
-    uint256 public superNodeBps;
-    // @deprecated — referral moved off-chain
-    uint256 public generalAgentBps;
+    uint256 private __deprecated_directReferralBps;   // slot preserved — do not remove
+    uint256 private __deprecated_indirectReferralBps; // slot preserved — do not remove
+    uint256 private __deprecated_nodeBoostBps;        // slot preserved — do not remove
+    uint256 private __deprecated_superNodeBps;        // slot preserved — do not remove
+    uint256 private __deprecated_generalAgentBps;     // slot preserved — do not remove
 
     // ─── Tier config ──────────────────────────────────────────────────────────
     struct TierConfig {
@@ -159,8 +151,7 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     mapping(address => mapping(uint8 => uint256[])) private _lockedSerials;
     mapping(uint8 => mapping(uint256 => uint256))   private _lockedSerialIndex;
 
-    // @deprecated — referral moved off-chain
-    bool public onChainReferralEnabled;
+    bool private __deprecated_onChainReferralEnabled; // slot preserved — do not remove
 
     // ─── Ops role (giftCard caller) ───────────────────────────────────────────
     mapping(address => bool) public opsRole;
@@ -262,12 +253,6 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         usdc     = IERC20(_usdc);
         treasury = _treasury;
         uri      = "https://biliquid.io/metadata/{id}.json";
-
-        directReferralBps   = 1000;
-        indirectReferralBps =  500;
-        nodeBoostBps        =  500;
-        superNodeBps        =  500;
-        generalAgentBps     =  500;
 
         _addTerm(3,  10000);
         _addTerm(6,  13333);
@@ -708,10 +693,6 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     function setOpsRole(address wallet, bool enabled) external onlyOwner {
         opsRole[wallet] = enabled;
     }
-
-    /// @dev Deprecated — referral rates are now managed off-chain. Kept as no-op for ABI compatibility.
-    function setReferralRates(uint256, uint256, uint256, uint256, uint256) external onlyOwner {}
-
 
     function setUri(string calldata newUri) external onlyOwner { uri = newUri; }
     function setUsdc(address _usdc)         external onlyOwner { usdc = IERC20(_usdc); }
