@@ -147,7 +147,7 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     mapping(address => bool) public opsRole;
 
     // ─── Events ───────────────────────────────────────────────────────────────
-    event Registered      (address indexed wallet, address indexed referrer, uint8 role);
+    event RoleSet         (address indexed wallet, uint8 role);
     event CardMinted      (address indexed to, uint8 indexed tier, uint256 serial);
     event CardGifted      (address indexed to, uint8 indexed tier, uint256 serial);
     event CardTransferred (address indexed from, address indexed to, uint8 tier, uint256 serial);
@@ -186,8 +186,6 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     error MintCapReached();
     error PaymentFailed();
     error ZeroRecipient();
-    error NotInGiftPool();
-    error CardStaked();
     error ZeroAddress();
     error NotOwner();
     error CardIsLocked();
@@ -212,7 +210,6 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     error TermNotFound();
     error PositionStillOpen();
     error PrincipalReturnFailed();
-    error UseNonMemberUnstake();
     error UsdcReturnFailed();
     error NonMemberFlexibleDisabled();
     error FlexibleStakingDisabled();
@@ -224,7 +221,6 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     error OnlyMinter();
     error SynthTierInvalid();
     error SynthNotOwner();
-    error SynthMintCap();
 
     // ─── Modifiers ────────────────────────────────────────────────────────────
     modifier notPaused()   { if (paused) revert Paused(); _; }
@@ -269,7 +265,7 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     function setRole(address wallet, uint8 role) external onlyOwner {
         if (role > ROLE_GENERAL_AGENT) revert InvalidRole();
         roleOf[wallet] = role;
-        emit Registered(wallet, address(0), role);
+        emit RoleSet(wallet, role);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
