@@ -55,21 +55,13 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     uint8 public constant DIAMOND  = 3;
     uint8 public constant BLACK    = 4;
 
-    // ─── Referral roles (managed off-chain; roleOf still written on-chain for backend reads) ──
+    // ─── Referral roles (managed off-chain; roleOf written on-chain for backend reads) ─────────
     uint8 public constant ROLE_USER          = 0;
     uint8 public constant ROLE_NODE          = 1;
     uint8 public constant ROLE_SUPERNODE     = 2;
     uint8 public constant ROLE_GENERAL_AGENT = 3;
 
-    mapping(address => address) private __deprecated_referrerOf;       // slot preserved — do not remove
-    mapping(address => uint8)   public  roleOf;
-    mapping(address => uint256) private __deprecated_registrationDepth; // slot preserved — do not remove
-
-    uint256 private __deprecated_directReferralBps;   // slot preserved — do not remove
-    uint256 private __deprecated_indirectReferralBps; // slot preserved — do not remove
-    uint256 private __deprecated_nodeBoostBps;        // slot preserved — do not remove
-    uint256 private __deprecated_superNodeBps;        // slot preserved — do not remove
-    uint256 private __deprecated_generalAgentBps;     // slot preserved — do not remove
+    mapping(address => uint8) public roleOf;
 
     // ─── Tier config ──────────────────────────────────────────────────────────
     struct TierConfig {
@@ -150,8 +142,6 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     // ─── Per-user locked serial index (for dashboard discovery) ──────────────
     mapping(address => mapping(uint8 => uint256[])) private _lockedSerials;
     mapping(uint8 => mapping(uint256 => uint256))   private _lockedSerialIndex;
-
-    bool private __deprecated_onChainReferralEnabled; // slot preserved — do not remove
 
     // ─── Ops role (giftCard caller) ───────────────────────────────────────────
     mapping(address => bool) public opsRole;
