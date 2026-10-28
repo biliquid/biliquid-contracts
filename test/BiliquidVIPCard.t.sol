@@ -975,6 +975,92 @@ contract BiliquidVIPCardTest is Test {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    //  BVI-5: member interest stops accruing after unlockedAt for fixed-term positions
+    //  BVI-11: lastClaimAt only advances when accrued > 0
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_bvi5_no_interest_after_unlocked() public {
+        uint256 serial = _aliceLockGold();
+        uint256 amount = 100_000_000;
+        vm.prank(alice); card.openPosition(1, serial, 3, amount); // 3-month fixed
+
+        uint256 unlockedAt = block.timestamp + 3 * SECONDS_PER_MONTH;
+        // Warp well past expiry
+        vm.warp(unlockedAt + 365 days);
+
+        // pendingMemberInterest must be capped at exactly 3 months of interest
+        uint256 pending = card.pendingMemberInterest(1, serial);
+        uint256 maxInterest = amount * 900 * (3 * SECONDS_PER_MONTH) / (10_000 * 365 days);
+        assertEq(pending, maxInterest, "interest must not accrue past expiry");
+    }
+
+    function test_bvi5_claimAfterExpiry_onlyPreExpiryInterest() public {
+        uint256 serial = _aliceLockGold();
+        uint256 amount = 100_000_000;
+        vm.prank(alice); card.openPosition(1, serial, 3, amount);
+
+        uint256 unlockedAt = block.timestamp + 3 * SECONDS_PER_MONTH;
+        vm.warp(unlockedAt + 5 * SECONDS_PER_DAY); // 5 days past expiry
+
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        vm.prank(alice); card.claimMemberInterest(1, serial);
+        uint256 received = usdc.balanceOf(alice) - aliceBefore;
+
+        // Expected: only the 3-month window (90 days in seconds), not 95 days
+        uint256 expected = uint256(amount) * 900 * 5 * SECONDS_PER_DAY / (10_000 * 365 days) * (3 * 30);
+        // Simpler: exact 3-month interest
+        uint256 exactThreeMonth = amount * 900 * (3 * SECONDS_PER_MONTH) / (10_000 * 365 days);
+        assertEq(received, exactThreeMonth, "only pre-expiry interest paid");
+    }
+
+    function test_bvi5_flexible_position_accrues_indefinitely() public {
+        // Enable member flexible staking (disabled by default)
+        vm.prank(owner_); card.setMemberFlexibleStaking(true, 900);
+
+        uint256 serial = _aliceLockGold();
+        uint256 amount = 100_000_000;
+        vm.prank(alice); card.openPosition(1, serial, 0, amount); // 0 = flexible
+
+        vm.warp(block.timestamp + 400 days); // >1 year
+
+        uint256 pending = card.pendingMemberInterest(1, serial);
+        uint256 expectedFlexible = amount * 900 * 400 days / (10_000 * 365 days);
+        assertEq(pending, expectedFlexible, "flexible position accrues beyond 365 days");
+    }
+
+    function test_bvi11_lastClaimAt_does_not_advance_on_zero_accrual() public {
+        uint256 serial = _aliceLockGold();
+        uint256 amount = 100_000_000;
+        vm.prank(alice); card.openPosition(1, serial, 3, amount);
+
+        uint256 lastClaimAtBefore = card.getPosition(1, serial).lastClaimAt;
+
+        // addToPosition at the same timestamp (zero elapsed → zero accrual) must not advance lastClaimAt
+        usdc.mint(alice, 1_000_000);
+        vm.prank(alice); usdc.approve(address(card), 1_000_000);
+        vm.prank(alice); card.addToPosition(1, serial, 1_000_000);
+
+        uint256 lastClaimAtAfter = card.getPosition(1, serial).lastClaimAt;
+        assertEq(lastClaimAtAfter, lastClaimAtBefore, "lastClaimAt must not advance on zero accrual");
+    }
+
+    function test_bvi11_interest_not_lost_on_rapid_addToPosition() public {
+        uint256 serial = _aliceLockGold();
+        uint256 amount = 100_000_000;
+        vm.prank(alice); card.openPosition(1, serial, 3, amount);
+
+        // Warp 30 days, then add to position (should accrue 30 days of interest)
+        vm.warp(block.timestamp + 30 days);
+        uint256 expectedAccrued = amount * 900 * 30 days / (10_000 * 365 days);
+
+        vm.prank(alice); card.addToPosition(1, serial, 1_000_000);
+
+        // claimableAmount must capture the 30-day accrual before the add
+        BiliquidVIPCard.Position memory pos = card.getPosition(1, serial);
+        assertEq(pos.claimableAmount, expectedAccrued, "30 days interest captured in claimableAmount");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     //  BVI-12: synthesizeCard properly burns cards (no address(0) credit)
     // ═══════════════════════════════════════════════════════════════════════════
 

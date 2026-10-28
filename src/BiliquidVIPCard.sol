@@ -601,7 +601,11 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     function pendingMemberInterest(uint8 tier, uint256 serial) external view returns (uint256) {
         Position storage p = positions[tier][serial];
         if (!p.active || p.usdcPrincipal == 0) return 0;
-        uint256 accrued = p.usdcPrincipal * p.snapshotApyBps * (block.timestamp - p.lastClaimAt) / (10_000 * 365 days);
+        // BVI-5: cap accrual at unlockedAt for expired fixed-term positions
+        uint256 end = block.timestamp;
+        if (!p.isFlexible && p.unlockedAt > 0 && end > p.unlockedAt) end = p.unlockedAt;
+        uint256 elapsed = end > p.lastClaimAt ? end - p.lastClaimAt : 0;
+        uint256 accrued = p.usdcPrincipal * p.snapshotApyBps * elapsed / (10_000 * 365 days);
         return p.claimableAmount + accrued;
     }
 
@@ -703,18 +707,33 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     ///      principal changes reset the accrual window without forcing a claim.
     function _settleAndAccrue(uint8 tier, uint256 serial) internal {
         Position storage p = positions[tier][serial];
-        uint256 accrued = p.usdcPrincipal * p.snapshotApyBps * (block.timestamp - p.lastClaimAt)
+        // BVI-5: fixed-term positions stop accruing after unlockedAt
+        uint256 end = block.timestamp;
+        bool atExpiry = false;
+        if (!p.isFlexible && p.unlockedAt > 0 && end > p.unlockedAt) {
+            end = p.unlockedAt;
+            atExpiry = true;
+        }
+        if (end <= p.lastClaimAt) return;  // already settled through effective end
+        uint256 accrued = p.usdcPrincipal * p.snapshotApyBps * (end - p.lastClaimAt)
                           / (10_000 * 365 days);
-        p.lastClaimAt = block.timestamp;
-        if (accrued > 0) p.claimableAmount += accrued;
+        if (accrued > 0) {
+            p.lastClaimAt = end;        // BVI-11: only advance on non-zero accrual
+            p.claimableAmount += accrued;
+        } else if (atExpiry) {
+            p.lastClaimAt = end;        // always advance past expiry to prevent re-entry
+        }
     }
 
     /// @dev Pay out claimableAmount + newly accrued interest. Used by claim / close.
     function _settleAndPay(uint8 tier, uint256 serial, address to) internal returns (uint256 interest) {
         Position storage p = positions[tier][serial];
-        uint256 accrued = p.usdcPrincipal * p.snapshotApyBps * (block.timestamp - p.lastClaimAt)
-                          / (10_000 * 365 days);
-        p.lastClaimAt = block.timestamp;
+        // BVI-5: fixed-term positions stop accruing after unlockedAt
+        uint256 end = block.timestamp;
+        if (!p.isFlexible && p.unlockedAt > 0 && end > p.unlockedAt) end = p.unlockedAt;
+        uint256 elapsed = end > p.lastClaimAt ? end - p.lastClaimAt : 0;
+        uint256 accrued = p.usdcPrincipal * p.snapshotApyBps * elapsed / (10_000 * 365 days);
+        p.lastClaimAt = end;  // always advance on explicit pay
         interest = p.claimableAmount + accrued;
         p.claimableAmount = 0;
         if (interest > 0) {
