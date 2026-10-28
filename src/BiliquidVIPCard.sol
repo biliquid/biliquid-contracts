@@ -329,7 +329,7 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         // Interleaved check+burn prevents duplicate-serial exploits
         for (uint256 i = 0; i < required; ) {
             if (cardOwner[fromTier][serials[i]] != me) revert SynthNotOwner();
-            _transferCard(me, address(0), fromTier, serials[i]);
+            _burnCard(me, fromTier, serials[i]);  // BVI-12: proper burn, no address(0) credit
             unchecked { ++i; }
         }
         uint256 newSerial = nextFreeSerial[toTier]++;  // BVI-1: independent counter, no mintCap interference
@@ -729,6 +729,21 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         _ownedSerials[to][tier].push(serial);
         _balances[to][tier]++;
         emit TransferSingle(msg.sender, address(0), to, tier, 1);
+    }
+
+    /// @dev ERC-1155-compliant burn: removes the card from `from` without crediting address(0).
+    ///      Used by synthesizeCard to correctly burn input cards (BVI-12).
+    function _burnCard(address from, uint8 tier, uint256 serial) internal {
+        uint256[] storage fromList = _ownedSerials[from][tier];
+        uint256 idx        = _ownedSerialIndex[tier][serial];
+        uint256 lastSerial = fromList[fromList.length - 1];
+        fromList[idx]                       = lastSerial;
+        _ownedSerialIndex[tier][lastSerial] = idx;
+        fromList.pop();
+        delete _ownedSerialIndex[tier][serial];
+        delete cardOwner[tier][serial];
+        _balances[from][tier]--;
+        emit TransferSingle(msg.sender, from, address(0), tier, 1);
     }
 
     function _transferCard(address from, address to, uint8 tier, uint256 serial) internal {

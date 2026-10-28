@@ -975,6 +975,38 @@ contract BiliquidVIPCardTest is Test {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    //  BVI-12: synthesizeCard properly burns cards (no address(0) credit)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_bvi12_synthesize_does_not_credit_zero_address() public {
+        // Mint 4 Gold cards and synthesize — burned cards must not appear in address(0) balance
+        vm.startPrank(alice);
+        card.mintCard(1, 4);
+        uint256[] memory golds = card.getCardsByOwner(alice, 1);
+        card.synthesizeCard(1, golds);
+        vm.stopPrank();
+
+        // address(0) must own 0 Gold cards (not 4)
+        assertEq(card.balanceOf(address(0), 1), 0, "address(0) balance must be 0");
+        // burned serials must have no owner
+        for (uint256 i = 0; i < golds.length; i++) {
+            assertEq(card.cardOwner(1, golds[i]), address(0), "burned card has no owner");
+        }
+    }
+
+    function test_bvi12_burned_cards_have_no_owner() public {
+        // After synthesis, burned Gold serials must not be present in any list
+        vm.startPrank(alice);
+        card.mintCard(1, 4);
+        uint256[] memory golds = card.getCardsByOwner(alice, 1);
+        card.synthesizeCard(1, golds);
+        vm.stopPrank();
+
+        // Alice should have 0 Gold cards remaining
+        assertEq(card.getCardsByOwner(alice, 1).length, 0, "alice has no gold left");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     //  BVI-13: giftCard uses nextFreeSerial, not nextSerial
     // ═══════════════════════════════════════════════════════════════════════════
 
