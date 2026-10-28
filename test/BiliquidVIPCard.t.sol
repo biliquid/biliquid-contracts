@@ -975,6 +975,44 @@ contract BiliquidVIPCardTest is Test {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    //  BVI-7: addToPosition reverts on expired fixed-term positions
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_bvi7_addToPosition_afterExpiry_reverts() public {
+        uint256 serial = _aliceLockGold();
+        vm.prank(alice); card.openPosition(1, serial, 3, 100_000_000);
+
+        // Warp past expiry
+        vm.warp(block.timestamp + 3 * SECONDS_PER_MONTH + 1);
+
+        vm.prank(alice);
+        vm.expectRevert(BiliquidVIPCard.PositionExpired.selector);
+        card.addToPosition(1, serial, 1_000_000);
+    }
+
+    function test_bvi7_addToPosition_beforeExpiry_stillWorks() public {
+        uint256 serial = _aliceLockGold();
+        vm.prank(alice); card.openPosition(1, serial, 3, 100_000_000);
+
+        // Warp to just before expiry
+        vm.warp(block.timestamp + 3 * SECONDS_PER_MONTH - 1);
+
+        vm.prank(alice); card.addToPosition(1, serial, 1_000_000); // must not revert
+        assertEq(card.getPosition(1, serial).usdcPrincipal, 101_000_000);
+    }
+
+    function test_bvi7_addToPosition_flexible_always_allowed() public {
+        vm.prank(owner_); card.setMemberFlexibleStaking(true, 900);
+        uint256 serial = _aliceLockGold();
+        vm.prank(alice); card.openPosition(1, serial, 0, 100_000_000); // flexible
+
+        // Flexible positions have no expiry — addToPosition must always work
+        vm.warp(block.timestamp + 365 days * 5);
+        vm.prank(alice); card.addToPosition(1, serial, 1_000_000);
+        assertEq(card.getPosition(1, serial).usdcPrincipal, 101_000_000);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     //  BVI-5: member interest stops accruing after unlockedAt for fixed-term positions
     //  BVI-11: lastClaimAt only advances when accrued > 0
     // ═══════════════════════════════════════════════════════════════════════════

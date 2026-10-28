@@ -202,6 +202,7 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     error NoActivePosition();
     error UseClosePosition();
     error StillLocked();
+    error PositionExpired();
     error CannotUpgradeFlexible();
     error InvalidTerm();
     error MustUpgradeToLonger();
@@ -401,6 +402,8 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         Position storage p = positions[tier][serial];
         if (!p.active) revert NoActivePosition();
         if (amount == 0) revert ZeroAmount();
+        // BVI-7: disallow adding to an expired fixed-term position; user must close and re-stake
+        if (!p.isFlexible && p.unlockedAt > 0 && block.timestamp >= p.unlockedAt) revert PositionExpired();
         TierConfig storage cfg = tierConfigs[tier];
         if (p.usdcPrincipal + amount > cfg.maxStakeAmountUsdc) revert ExceedsCardCapacity();
 
