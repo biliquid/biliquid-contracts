@@ -442,6 +442,8 @@ contract BiliquidVIPCard is Initializable, Ownable2StepUpgradeable, UUPSUpgradea
         Position storage p = positions[tier][serial];
         if (!p.active) revert NoActivePosition();
         if (p.isFlexible) revert CannotUpgradeFlexible();
+        // BVI-5: disallow upgrading an expired fixed-term position; user must close and re-stake
+        if (p.unlockedAt > 0 && block.timestamp >= p.unlockedAt) revert PositionExpired();
         if (!_isValidTerm(newTermMonths)) revert InvalidTerm();
         if (newTermMonths <= p.termMonths) revert MustUpgradeToLonger();
 

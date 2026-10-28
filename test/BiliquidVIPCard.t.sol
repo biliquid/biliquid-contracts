@@ -1280,4 +1280,49 @@ contract BiliquidVIPCardTest is Test {
         assertEq(received, NON_MEMBER_AMOUNT + expectedInterest, "exactly 3 months interest");
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  BVI-5 (follow-up): upgradeTerms must revert on expired fixed-term positions
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_bvi5_upgradeTerms_afterExpiry_reverts() public {
+        uint256 serial = _aliceLockGold();
+        uint256 openedAt = block.timestamp;
+        vm.prank(alice); card.openPosition(1, serial, 3, 100_000_000);
+
+        // Warp past the 3-month expiry
+        vm.warp(openedAt + 3 * SECONDS_PER_MONTH + 1);
+
+        vm.prank(alice);
+        vm.expectRevert(BiliquidVIPCard.PositionExpired.selector);
+        card.upgradeTerms(1, serial, 6);
+    }
+
+    function test_bvi5_upgradeTerms_beforeExpiry_stillWorks() public {
+        uint256 serial = _aliceLockGold();
+        uint256 openedAt = block.timestamp;
+        vm.prank(alice); card.openPosition(1, serial, 3, 100_000_000);
+
+        // Warp to just before expiry
+        vm.warp(openedAt + 3 * SECONDS_PER_MONTH - 1);
+
+        vm.prank(alice); card.upgradeTerms(1, serial, 6);
+
+        BiliquidVIPCard.Position memory pos = card.getPosition(1, serial);
+        assertEq(pos.termMonths, 6, "term upgraded before expiry");
+        assertEq(pos.unlockedAt, pos.openedAt + 6 * SECONDS_PER_MONTH, "new unlockedAt set correctly");
+    }
+
+    function test_bvi5_upgradeTerms_atExactExpiry_reverts() public {
+        uint256 serial = _aliceLockGold();
+        uint256 openedAt = block.timestamp;
+        vm.prank(alice); card.openPosition(1, serial, 3, 100_000_000);
+
+        // Warp to exactly unlockedAt (inclusive boundary is expired)
+        vm.warp(openedAt + 3 * SECONDS_PER_MONTH);
+
+        vm.prank(alice);
+        vm.expectRevert(BiliquidVIPCard.PositionExpired.selector);
+        card.upgradeTerms(1, serial, 6);
+    }
+
 }
