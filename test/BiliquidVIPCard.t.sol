@@ -1166,4 +1166,81 @@ contract BiliquidVIPCardTest is Test {
         assertEq(card.cardOwner(2, freeSerialBefore), alice, "alice owns synthesized platinum");
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  BVI-10: non-member fixed-term interest stops at unlockedAt
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_bvi10_nonMember_noInterestAfterExpiry() public {
+        vm.prank(bob); card.stakeNonMember(3); // 3-month fixed stake
+        BiliquidVIPCard.StakeRecord[] memory recs = card.getStakeRecords(bob);
+        uint256 unlockedAt = recs[0].unlockedAt;
+
+        // Claim just at expiry — should work
+        vm.warp(unlockedAt);
+        uint256 bobBefore = usdc.balanceOf(bob);
+        vm.prank(bob); card.claimInterest(0);
+        uint256 atExpiryClaim = usdc.balanceOf(bob) - bobBefore;
+
+        // Warp far past expiry and claim again — must get zero additional
+        vm.warp(unlockedAt + 365 days);
+        bobBefore = usdc.balanceOf(bob);
+        vm.prank(bob); card.claimInterest(0);
+        uint256 postExpiryClaim = usdc.balanceOf(bob) - bobBefore;
+
+        assertEq(postExpiryClaim, 0, "no interest after fixed-term expiry");
+        // Sanity: the at-expiry claim must have been non-zero
+        assertGt(atExpiryClaim, 0, "interest earned before expiry");
+    }
+
+    function test_bvi10_nonMember_unstake_afterExpiry_noExtraInterest() public {
+        vm.prank(bob); card.stakeNonMember(3);
+        BiliquidVIPCard.StakeRecord[] memory recs = card.getStakeRecords(bob);
+        uint256 unlockedAt = recs[0].unlockedAt;
+
+        // Claim at expiry to lock in pre-expiry interest
+        vm.warp(unlockedAt);
+        vm.prank(bob); card.claimInterest(0);
+
+        // Warp 1 extra year past expiry, then unstake
+        vm.warp(unlockedAt + 365 days);
+        uint256 bobBefore = usdc.balanceOf(bob);
+        vm.prank(bob); card.unstakeNonMember(0);
+
+        // Should receive principal only (no post-expiry interest)
+        uint256 received = usdc.balanceOf(bob) - bobBefore;
+        assertEq(received, NON_MEMBER_AMOUNT, "only principal returned, no post-expiry interest");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  BVI-2: non-member fixed-term drops partial (< 30-day) period interest
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_bvi2_unstake_drops_partial_period() public {
+        // Stake flexible (no lock) to avoid StillLocked on early unstake
+        vm.prank(bob); card.stakeNonMember(0); // flexible
+        // Warp 45 days — only 1 complete 30-day month, 15-day partial dropped
+        vm.warp(block.timestamp + 45 days);
+        uint256 bobBefore = usdc.balanceOf(bob);
+        vm.prank(bob); card.unstakeNonMember(0);
+        uint256 received = usdc.balanceOf(bob) - bobBefore;
+        // Expected: principal + 1 month interest only (not 1.5 months)
+        (,, uint256 flexibleApyBps,) = card.nonMemberConfig();
+        uint256 dailyInterest = NON_MEMBER_AMOUNT * flexibleApyBps / (10_000 * 365);
+        uint256 expectedInterest = dailyInterest * 30; // 1 complete month = 30 days
+        assertEq(received, NON_MEMBER_AMOUNT + expectedInterest, "partial 30-day period dropped");
+    }
+
+    function test_bvi2_unstake_pays_exactly_whole_months() public {
+        // Stake flexible, warp exactly 3 months — all 3 months should be paid
+        vm.prank(bob); card.stakeNonMember(0);
+        vm.warp(block.timestamp + 3 * SECONDS_PER_MONTH);
+        uint256 bobBefore = usdc.balanceOf(bob);
+        vm.prank(bob); card.unstakeNonMember(0);
+        uint256 received = usdc.balanceOf(bob) - bobBefore;
+        (,, uint256 flexibleApyBps2,) = card.nonMemberConfig();
+        uint256 dailyInterest = NON_MEMBER_AMOUNT * flexibleApyBps2 / (10_000 * 365);
+        uint256 expectedInterest = dailyInterest * 90; // 3 months × 30 days
+        assertEq(received, NON_MEMBER_AMOUNT + expectedInterest, "exactly 3 months interest");
+    }
+
 }

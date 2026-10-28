@@ -828,7 +828,11 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     }
 
     function _claimInterestLegacy(address wallet, uint256 stakeId, StakeRecord storage rec) internal {
-        uint256 monthsPast = (block.timestamp - rec.lastClaimAt) / SECONDS_PER_MONTH;
+        // BVI-10: fixed-term non-member stakes stop accruing interest after unlockedAt
+        uint256 claimEnd = block.timestamp;
+        if (!rec.isFlexible && claimEnd > rec.unlockedAt) claimEnd = rec.unlockedAt;
+        if (claimEnd <= rec.lastClaimAt) return;  // already settled through effective end
+        uint256 monthsPast = (claimEnd - rec.lastClaimAt) / SECONDS_PER_MONTH;
         if (monthsPast == 0) return;
         uint256 daysPast = monthsPast * 30;
         uint256 interest = _dailyInterest(rec) * daysPast;
