@@ -723,11 +723,13 @@ contract BiliquidVIPCard is Initializable, Ownable2StepUpgradeable, UUPSUpgradea
         if (end <= p.lastClaimAt) return;  // already settled through effective end
         uint256 accrued = p.usdcPrincipal * p.snapshotApyBps * (end - p.lastClaimAt)
                           / (10_000 * 365 days);
+        // Always advance lastClaimAt regardless of accrued amount.
+        // Leaving it at openedAt when accrued == 0 (e.g. dust principal) would allow a
+        // retroactive-inflation attack: deposit a large principal just before expiry, then
+        // close and collect interest computed over the entire term at the new principal.
+        p.lastClaimAt = end;
         if (accrued > 0) {
-            p.lastClaimAt = end;        // BVI-11: only advance on non-zero accrual
             p.claimableAmount += accrued;
-        } else if (atExpiry) {
-            p.lastClaimAt = end;        // always advance past expiry to prevent re-entry
         }
     }
 

@@ -1312,6 +1312,48 @@ contract BiliquidVIPCardTest is Test {
         assertEq(pos.unlockedAt, pos.openedAt + 6 * SECONDS_PER_MONTH, "new unlockedAt set correctly");
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  BVI-11 (regression): retroactive-inflation via dust principal + addToPosition
+    //  Attack: open with 1 wei → lastClaimAt stays at openedAt (accrued==0) →
+    //          add large principal just before expiry → close → interest on full
+    //          term at new principal.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_bvi11_dustPrincipal_addBeforeExpiry_noRetroactiveInterest() public {
+        uint256 serial = _aliceLockGold();
+        uint256 openedAt = block.timestamp;
+
+        // Open with 1 wei principal
+        usdc.mint(alice, 1);
+        vm.prank(alice); usdc.approve(address(card), 1);
+        vm.prank(alice); card.openPosition(1, serial, 3, 1);
+
+        // Warp to 1 second before expiry; addToPosition with a large amount
+        uint256 expiry = openedAt + 3 * SECONDS_PER_MONTH;
+        vm.warp(expiry - 1);
+
+        uint256 bigDeposit = 100_000_000; // 100 USDC
+        usdc.mint(alice, bigDeposit);
+        vm.prank(alice); usdc.approve(address(card), bigDeposit);
+        vm.prank(alice); card.addToPosition(1, serial, bigDeposit);
+
+        // Close at expiry — interest should only be ~1 second on bigDeposit,
+        // NOT the entire 3-month term.
+        vm.warp(expiry + 1);
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        vm.prank(alice); card.closePosition(1, serial);
+        uint256 received = usdc.balanceOf(alice) - aliceBefore;
+
+        // Principal returned = 1 + bigDeposit
+        uint256 principal = 1 + bigDeposit;
+        assertGe(received, principal, "at least principal returned");
+
+        // Interest must be tiny (at most 1 second on bigDeposit at any APY)
+        // Max reasonable: 100 USDC * 30% APY * 2 seconds / (365 days) ≈ 0.002 USDC = 2000 units
+        uint256 interest = received - principal;
+        assertLt(interest, 3000, "interest must be near-zero, not full-term retroactive");
+    }
+
     function test_bvi5_upgradeTerms_atExactExpiry_reverts() public {
         uint256 serial = _aliceLockGold();
         uint256 openedAt = block.timestamp;
