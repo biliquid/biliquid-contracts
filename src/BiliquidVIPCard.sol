@@ -22,7 +22,7 @@ pragma solidity ^0.8.24;
 
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 
 interface IERC20 {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
@@ -30,7 +30,7 @@ interface IERC20 {
     function balanceOf(address account) external view returns (uint256);
 }
 
-contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
+contract BiliquidVIPCard is Initializable, Ownable2StepUpgradeable, UUPSUpgradeable {
 
     // ─── Reentrancy guard ─────────────────────────────────────────────────────
     uint256 private _reentrancyStatus;
@@ -240,6 +240,7 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
 
     function initialize(address _usdc, address _treasury) external initializer {
         __Ownable_init(msg.sender);
+        __Ownable2Step_init_unchained();
         _reentrancyStatus = 1;
         usdc     = IERC20(_usdc);
         treasury = _treasury;

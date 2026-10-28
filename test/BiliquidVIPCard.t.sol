@@ -93,6 +93,43 @@ contract BiliquidVIPCardTest is Test {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    //  CMD-3 (BiliquidVIPCard): Ownable2Step — two-step ownership transfer
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_cmd3_card_transferOwnership_isTwoStep() public {
+        address newOwner = address(0xCAFE);
+        vm.prank(owner_);
+        card.transferOwnership(newOwner);
+        assertEq(card.owner(),        owner_,   "owner unchanged until accepted");
+        assertEq(card.pendingOwner(), newOwner, "newOwner is pendingOwner");
+    }
+
+    function test_cmd3_card_ownershipNotEffectiveUntilAccepted() public {
+        address newOwner = address(0xCAFE);
+        vm.prank(owner_); card.transferOwnership(newOwner);
+        vm.prank(newOwner);
+        vm.expectRevert();
+        card.setPaused(true); // onlyOwner — must fail before accept
+    }
+
+    function test_cmd3_card_acceptOwnership_completes_transfer() public {
+        address newOwner = address(0xCAFE);
+        vm.prank(owner_); card.transferOwnership(newOwner);
+        vm.prank(newOwner); card.acceptOwnership();
+        assertEq(card.owner(),        newOwner,    "ownership transferred");
+        assertEq(card.pendingOwner(), address(0),  "pendingOwner cleared");
+    }
+
+    function test_cmd3_card_onlyPendingOwner_can_accept() public {
+        address newOwner = address(0xCAFE);
+        address attacker = address(0xBEEF);
+        vm.prank(owner_); card.transferOwnership(newOwner);
+        vm.prank(attacker);
+        vm.expectRevert();
+        card.acceptOwnership();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     //  INITIALIZATION
     // ═══════════════════════════════════════════════════════════════════════════
 
