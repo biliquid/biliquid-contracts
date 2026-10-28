@@ -88,7 +88,11 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     uint256 public memberFlexibleApyBps;
 
     // ─── Card serial tracking ─────────────────────────────────────────────────
-    mapping(uint8 => uint256) public nextSerial;
+    mapping(uint8 => uint256) public nextSerial;      // paid mints only (1..mintCap)
+    // BVI-1 / BVI-13: gift and synthesis cards use a separate counter starting above
+    // the paid-mint ceiling, so they never consume paid-mint quota.
+    uint256 public constant FREE_SERIAL_OFFSET = 1_000_000_001;
+    mapping(uint8 => uint256) public nextFreeSerial;  // gift + synthesis serials
     mapping(uint8 => mapping(uint256 => address)) public cardOwner;
     mapping(address => mapping(uint8 => uint256[])) private _ownedSerials;
     mapping(uint8 => mapping(uint256 => uint256))   private _ownedSerialIndex;
@@ -253,7 +257,8 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
 
         nonMemberConfig = NonMemberConfig({ stakeAmountUsdc: 100_000_000, baseApyBps: 300, flexibleApyBps: 300, flexibleEnabled: true });
 
-        nextSerial[GOLD] = nextSerial[PLATINUM] = nextSerial[DIAMOND] = nextSerial[BLACK] = 1;
+        nextSerial[GOLD]     = nextSerial[PLATINUM]     = nextSerial[DIAMOND]     = nextSerial[BLACK]     = 1;
+        nextFreeSerial[GOLD] = nextFreeSerial[PLATINUM] = nextFreeSerial[DIAMOND] = nextFreeSerial[BLACK] = FREE_SERIAL_OFFSET;
     }
 
     function _authorizeUpgrade(address) internal override onlyOwner {}
@@ -289,11 +294,11 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
 
     /// @notice Directly mint a card of any tier and gift it to recipient.
     ///         Caller must have opsRole. No USDC cost (free ops mint).
-    ///         Does NOT count against mintCap.
+    ///         Does NOT count against mintCap — uses nextFreeSerial, not nextSerial.
     function giftCard(uint8 tier, address recipient) external onlyOpsRole {
         if (recipient == address(0)) revert ZeroRecipient();
         _requireValidTier(tier);
-        uint256 serial = nextSerial[tier]++;
+        uint256 serial = nextFreeSerial[tier]++;  // BVI-13: independent counter, no mintCap interference
         _assignCard(recipient, tier, serial);
         emit CardGifted(recipient, tier, serial);
     }
@@ -327,7 +332,7 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
             _transferCard(me, address(0), fromTier, serials[i]);
             unchecked { ++i; }
         }
-        uint256 newSerial = nextSerial[toTier]++;
+        uint256 newSerial = nextFreeSerial[toTier]++;  // BVI-1: independent counter, no mintCap interference
         _assignCard(me, toTier, newSerial);
         emit CardSynthesized(me, fromTier, toTier, newSerial);
     }

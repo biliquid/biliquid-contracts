@@ -623,19 +623,19 @@ contract BiliquidVIPCardTest is Test {
     // ═══════════════════════════════════════════════════════════════════════════
 
     function test_giftCard_directMint() public {
-        // giftCard now mints directly to recipient (no adminMintToPool needed)
-        uint256 serialBefore = card.nextSerial(1);
+        // giftCard now uses nextFreeSerial (not nextSerial), so it does not touch mintCap quota
+        uint256 freeSerialBefore = card.nextFreeSerial(1);
         vm.prank(owner_); card.giftCard(1, bob);
-        assertEq(card.cardOwner(1, serialBefore), bob);
-        assertEq(card.nextSerial(1), serialBefore + 1);
+        assertEq(card.cardOwner(1, freeSerialBefore), bob);
+        assertEq(card.nextFreeSerial(1), freeSerialBefore + 1);
     }
 
     function test_giftCard_opsRole() public {
         address ops = address(0xBEEF);
         vm.prank(owner_); card.setOpsRole(ops, true);
-        uint256 serialBefore = card.nextSerial(2);
+        uint256 freeSerialBefore = card.nextFreeSerial(2);
         vm.prank(ops); card.giftCard(2, alice);
-        assertEq(card.cardOwner(2, serialBefore), alice);
+        assertEq(card.cardOwner(2, freeSerialBefore), alice);
     }
 
     function test_giftCard_rejects_non_ops() public {
@@ -972,6 +972,42 @@ contract BiliquidVIPCardTest is Test {
         vm.prank(alice);
         vm.expectRevert(BiliquidVIPCard.SynthTierInvalid.selector);
         card.synthesizeCard(diamond, four);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  BVI-13: giftCard uses nextFreeSerial, not nextSerial
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_giftCard_doesNotConsumeNextSerial() public {
+        uint256 paidSerialBefore = card.nextSerial(1);
+        vm.prank(owner_); card.giftCard(1, bob);
+        // nextSerial (paid-mint quota) must be unchanged
+        assertEq(card.nextSerial(1), paidSerialBefore, "paid serial counter must be unchanged");
+        // nextFreeSerial must have advanced
+        assertEq(card.nextFreeSerial(1), card.FREE_SERIAL_OFFSET() + 1, "free serial advanced");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  BVI-1: synthesizeCard uses nextFreeSerial for the new card's serial
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_bvi1_synthesize_doesNotConsumeNextSerial() public {
+        // Mint 4 Gold cards (paid-mint) and synthesize into one Platinum
+        vm.startPrank(alice);
+        card.mintCard(1, 4); // mint 4 Gold cards (serials 1..4)
+        uint256 paidSerialBefore = card.nextSerial(2); // Platinum paid counter
+        uint256 freeSerialBefore = card.nextFreeSerial(2); // Platinum free counter
+
+        uint256[] memory golds = card.getCardsByOwner(alice, 1);
+        card.synthesizeCard(1, golds);
+        vm.stopPrank();
+
+        // paid-mint quota for Platinum must be unchanged
+        assertEq(card.nextSerial(2), paidSerialBefore, "platinum paid serial unchanged");
+        // free serial counter advanced by 1
+        assertEq(card.nextFreeSerial(2), freeSerialBefore + 1, "free serial advanced");
+        // Alice owns the new Platinum at the free serial slot
+        assertEq(card.cardOwner(2, freeSerialBefore), alice, "alice owns synthesized platinum");
     }
 
 }
