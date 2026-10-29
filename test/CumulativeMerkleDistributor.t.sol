@@ -91,4 +91,64 @@ contract CumulativeMerkleDistributorTest is Test {
         vm.expectRevert();
         dist.setMerkleRoot(bytes32(uint256(2)));
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  CMD-3: Ownable2Step — two-step ownership transfer
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_cmd3_transferOwnership_isTwoStep() public {
+        address newOwner = address(0xCAFE);
+        // Initiate transfer — newOwner is only pendingOwner, not yet owner
+        dist.transferOwnership(newOwner);
+        assertEq(dist.owner(), address(this), "owner unchanged until accepted");
+        assertEq(dist.pendingOwner(), newOwner, "newOwner is pendingOwner");
+    }
+
+    function test_cmd3_ownershipNotEffectiveUntilAccepted() public {
+        address newOwner = address(0xCAFE);
+        dist.transferOwnership(newOwner);
+
+        // newOwner cannot call onlyOwner functions yet
+        vm.prank(newOwner);
+        vm.expectRevert();
+        dist.setMerkleRoot(bytes32(uint256(99)));
+    }
+
+    function test_cmd3_acceptOwnership_completes_transfer() public {
+        address newOwner = address(0xCAFE);
+        dist.transferOwnership(newOwner);
+
+        vm.prank(newOwner);
+        dist.acceptOwnership();
+
+        assertEq(dist.owner(), newOwner, "ownership transferred after accept");
+        assertEq(dist.pendingOwner(), address(0), "pendingOwner cleared");
+    }
+
+    function test_cmd3_onlyPendingOwner_can_accept() public {
+        address newOwner  = address(0xCAFE);
+        address attacker  = address(0xBEEF);
+        dist.transferOwnership(newOwner);
+
+        // Attacker cannot accept on behalf of pendingOwner
+        vm.prank(attacker);
+        vm.expectRevert();
+        dist.acceptOwnership();
+    }
+
+    function test_cmd3_random_transfer_to_wrong_address_is_recoverable() public {
+        // If owner accidentally initiates to wrong address, they can re-initiate
+        address wrongAddr = address(0xDEAD);
+        address rightAddr = address(0xCAFE);
+        dist.transferOwnership(wrongAddr);
+        assertEq(dist.pendingOwner(), wrongAddr);
+
+        // Owner re-initiates to correct address (overrides pendingOwner)
+        dist.transferOwnership(rightAddr);
+        assertEq(dist.pendingOwner(), rightAddr, "pendingOwner updated to correct address");
+
+        vm.prank(rightAddr);
+        dist.acceptOwnership();
+        assertEq(dist.owner(), rightAddr, "correct address is now owner");
+    }
 }
