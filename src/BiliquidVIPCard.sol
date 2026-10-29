@@ -89,10 +89,7 @@ contract BiliquidVIPCard is Initializable, Ownable2StepUpgradeable, UUPSUpgradea
 
     // ─── Card serial tracking ─────────────────────────────────────────────────
     mapping(uint8 => uint256) public nextSerial;      // paid mints only (1..mintCap)
-    // BVI-1 / BVI-13: gift and synthesis cards use a separate counter starting above
-    // the paid-mint ceiling, so they never consume paid-mint quota.
     uint256 public constant FREE_SERIAL_OFFSET = 1_000_000_001;
-    mapping(uint8 => uint256) public nextFreeSerial;  // gift + synthesis serials
     mapping(uint8 => mapping(uint256 => address)) public cardOwner;
     mapping(address => mapping(uint8 => uint256[])) private _ownedSerials;
     mapping(uint8 => mapping(uint256 => uint256))   private _ownedSerialIndex;
@@ -149,6 +146,11 @@ contract BiliquidVIPCard is Initializable, Ownable2StepUpgradeable, UUPSUpgradea
 
     // ─── Ops role (giftCard caller) ───────────────────────────────────────────
     mapping(address => bool) public opsRole;
+
+    // ─── Free serial counter (appended to preserve upgrade storage layout) ────
+    // BVI-1 / BVI-13: gift and synthesis cards use a separate counter starting
+    // above the paid-mint ceiling so they never consume paid-mint quota.
+    mapping(uint8 => uint256) public nextFreeSerial;
 
     // ─── Events ───────────────────────────────────────────────────────────────
     event RoleSet         (address indexed wallet, uint8 role);
