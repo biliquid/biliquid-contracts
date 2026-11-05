@@ -21,7 +21,7 @@ pragma solidity ^0.8.24;
  *  rescues stranded tokens.
  */
 
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 
 interface IERC20 {
@@ -29,7 +29,7 @@ interface IERC20 {
     function balanceOf(address account) external view returns (uint256);
 }
 
-contract CumulativeMerkleDistributor is Ownable {
+contract CumulativeMerkleDistributor is Ownable2Step {
     address public immutable token;
 
     bytes32 public merkleRoot;

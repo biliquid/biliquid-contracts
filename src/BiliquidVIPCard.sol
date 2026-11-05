@@ -22,7 +22,7 @@ pragma solidity ^0.8.24;
 
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 
 interface IERC20 {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
@@ -30,7 +30,7 @@ interface IERC20 {
     function balanceOf(address account) external view returns (uint256);
 }
 
-contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
+contract BiliquidVIPCard is Initializable, Ownable2StepUpgradeable, UUPSUpgradeable {
 
     // ─── Reentrancy guard ─────────────────────────────────────────────────────
     uint256 private _reentrancyStatus;
@@ -55,29 +55,13 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     uint8 public constant DIAMOND  = 3;
     uint8 public constant BLACK    = 4;
 
-    // ─── Referral roles ───────────────────────────────────────────────────────
+    // ─── Referral roles (managed off-chain; roleOf written on-chain for backend reads) ─────────
     uint8 public constant ROLE_USER          = 0;
     uint8 public constant ROLE_NODE          = 1;
     uint8 public constant ROLE_SUPERNODE     = 2;
     uint8 public constant ROLE_GENERAL_AGENT = 3;
 
-    // @deprecated — referral moved off-chain
-    mapping(address => address) public referrerOf;
-    mapping(address => uint8)   public roleOf;
-    // @deprecated — referral moved off-chain
-    mapping(address => uint256) public registrationDepth;
-    uint256 public constant MAX_REFERRAL_DEPTH = 20;
-
-    // @deprecated — referral moved off-chain
-    uint256 public directReferralBps;
-    // @deprecated — referral moved off-chain
-    uint256 public indirectReferralBps;
-    // @deprecated — referral moved off-chain
-    uint256 public nodeBoostBps;
-    // @deprecated — referral moved off-chain
-    uint256 public superNodeBps;
-    // @deprecated — referral moved off-chain
-    uint256 public generalAgentBps;
+    mapping(address => uint8) public roleOf;
 
     // ─── Tier config ──────────────────────────────────────────────────────────
     struct TierConfig {
@@ -104,7 +88,8 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     uint256 public memberFlexibleApyBps;
 
     // ─── Card serial tracking ─────────────────────────────────────────────────
-    mapping(uint8 => uint256) public nextSerial;
+    mapping(uint8 => uint256) public nextSerial;      // paid mints only (1..mintCap)
+    uint256 public constant FREE_SERIAL_OFFSET = 1_000_000_001;
     mapping(uint8 => mapping(uint256 => address)) public cardOwner;
     mapping(address => mapping(uint8 => uint256[])) private _ownedSerials;
     mapping(uint8 => mapping(uint256 => uint256))   private _ownedSerialIndex;
@@ -159,14 +144,16 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     mapping(address => mapping(uint8 => uint256[])) private _lockedSerials;
     mapping(uint8 => mapping(uint256 => uint256))   private _lockedSerialIndex;
 
-    // @deprecated — referral moved off-chain
-    bool public onChainReferralEnabled;
-
     // ─── Ops role (giftCard caller) ───────────────────────────────────────────
     mapping(address => bool) public opsRole;
 
+    // ─── Free serial counter (appended to preserve upgrade storage layout) ────
+    // BVI-1 / BVI-13: gift and synthesis cards use a separate counter starting
+    // above the paid-mint ceiling so they never consume paid-mint quota.
+    mapping(uint8 => uint256) public nextFreeSerial;
+
     // ─── Events ───────────────────────────────────────────────────────────────
-    event Registered      (address indexed wallet, address indexed referrer, uint8 role);
+    event RoleSet         (address indexed wallet, uint8 role);
     event CardMinted      (address indexed to, uint8 indexed tier, uint256 serial);
     event CardGifted      (address indexed to, uint8 indexed tier, uint256 serial);
     event CardTransferred (address indexed from, address indexed to, uint8 tier, uint256 serial);
@@ -205,8 +192,6 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     error MintCapReached();
     error PaymentFailed();
     error ZeroRecipient();
-    error NotInGiftPool();
-    error CardStaked();
     error ZeroAddress();
     error NotOwner();
     error CardIsLocked();
@@ -219,6 +204,7 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     error NoActivePosition();
     error UseClosePosition();
     error StillLocked();
+    error PositionExpired();
     error CannotUpgradeFlexible();
     error InvalidTerm();
     error MustUpgradeToLonger();
@@ -231,7 +217,6 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     error TermNotFound();
     error PositionStillOpen();
     error PrincipalReturnFailed();
-    error UseNonMemberUnstake();
     error UsdcReturnFailed();
     error NonMemberFlexibleDisabled();
     error FlexibleStakingDisabled();
@@ -243,7 +228,6 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     error OnlyMinter();
     error SynthTierInvalid();
     error SynthNotOwner();
-    error SynthMintCap();
 
     // ─── Modifiers ────────────────────────────────────────────────────────────
     modifier notPaused()   { if (paused) revert Paused(); _; }
@@ -258,16 +242,11 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
 
     function initialize(address _usdc, address _treasury) external initializer {
         __Ownable_init(msg.sender);
+        __Ownable2Step_init_unchained();
         _reentrancyStatus = 1;
         usdc     = IERC20(_usdc);
         treasury = _treasury;
         uri      = "https://biliquid.io/metadata/{id}.json";
-
-        directReferralBps   = 1000;
-        indirectReferralBps =  500;
-        nodeBoostBps        =  500;
-        superNodeBps        =  500;
-        generalAgentBps     =  500;
 
         _addTerm(3,  10000);
         _addTerm(6,  13333);
@@ -282,7 +261,8 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
 
         nonMemberConfig = NonMemberConfig({ stakeAmountUsdc: 100_000_000, baseApyBps: 300, flexibleApyBps: 300, flexibleEnabled: true });
 
-        nextSerial[GOLD] = nextSerial[PLATINUM] = nextSerial[DIAMOND] = nextSerial[BLACK] = 1;
+        nextSerial[GOLD]     = nextSerial[PLATINUM]     = nextSerial[DIAMOND]     = nextSerial[BLACK]     = 1;
+        nextFreeSerial[GOLD] = nextFreeSerial[PLATINUM] = nextFreeSerial[DIAMOND] = nextFreeSerial[BLACK] = FREE_SERIAL_OFFSET;
     }
 
     function _authorizeUpgrade(address) internal override onlyOwner {}
@@ -294,7 +274,7 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     function setRole(address wallet, uint8 role) external onlyOwner {
         if (role > ROLE_GENERAL_AGENT) revert InvalidRole();
         roleOf[wallet] = role;
-        emit Registered(wallet, address(0), role);
+        emit RoleSet(wallet, role);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -318,11 +298,11 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
 
     /// @notice Directly mint a card of any tier and gift it to recipient.
     ///         Caller must have opsRole. No USDC cost (free ops mint).
-    ///         Does NOT count against mintCap.
+    ///         Does NOT count against mintCap — uses nextFreeSerial, not nextSerial.
     function giftCard(uint8 tier, address recipient) external onlyOpsRole {
         if (recipient == address(0)) revert ZeroRecipient();
         _requireValidTier(tier);
-        uint256 serial = nextSerial[tier]++;
+        uint256 serial = nextFreeSerial[tier]++;  // BVI-13: independent counter, no mintCap interference
         _assignCard(recipient, tier, serial);
         emit CardGifted(recipient, tier, serial);
     }
@@ -353,10 +333,10 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         // Interleaved check+burn prevents duplicate-serial exploits
         for (uint256 i = 0; i < required; ) {
             if (cardOwner[fromTier][serials[i]] != me) revert SynthNotOwner();
-            _transferCard(me, address(0), fromTier, serials[i]);
+            _burnCard(me, fromTier, serials[i]);  // BVI-12: proper burn, no address(0) credit
             unchecked { ++i; }
         }
-        uint256 newSerial = nextSerial[toTier]++;
+        uint256 newSerial = nextFreeSerial[toTier]++;  // BVI-1: independent counter, no mintCap interference
         _assignCard(me, toTier, newSerial);
         emit CardSynthesized(me, fromTier, toTier, newSerial);
     }
@@ -425,6 +405,8 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         Position storage p = positions[tier][serial];
         if (!p.active) revert NoActivePosition();
         if (amount == 0) revert ZeroAmount();
+        // BVI-7: disallow adding to an expired fixed-term position; user must close and re-stake
+        if (!p.isFlexible && p.unlockedAt > 0 && block.timestamp >= p.unlockedAt) revert PositionExpired();
         TierConfig storage cfg = tierConfigs[tier];
         if (p.usdcPrincipal + amount > cfg.maxStakeAmountUsdc) revert ExceedsCardCapacity();
 
@@ -462,6 +444,8 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         Position storage p = positions[tier][serial];
         if (!p.active) revert NoActivePosition();
         if (p.isFlexible) revert CannotUpgradeFlexible();
+        // BVI-5: disallow upgrading an expired fixed-term position; user must close and re-stake
+        if (p.unlockedAt > 0 && block.timestamp >= p.unlockedAt) revert PositionExpired();
         if (!_isValidTerm(newTermMonths)) revert InvalidTerm();
         if (newTermMonths <= p.termMonths) revert MustUpgradeToLonger();
 
@@ -625,7 +609,11 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     function pendingMemberInterest(uint8 tier, uint256 serial) external view returns (uint256) {
         Position storage p = positions[tier][serial];
         if (!p.active || p.usdcPrincipal == 0) return 0;
-        uint256 accrued = p.usdcPrincipal * p.snapshotApyBps * (block.timestamp - p.lastClaimAt) / (10_000 * 365 days);
+        // BVI-5: cap accrual at unlockedAt for expired fixed-term positions
+        uint256 end = block.timestamp;
+        if (!p.isFlexible && p.unlockedAt > 0 && end > p.unlockedAt) end = p.unlockedAt;
+        uint256 elapsed = end > p.lastClaimAt ? end - p.lastClaimAt : 0;
+        uint256 accrued = p.usdcPrincipal * p.snapshotApyBps * elapsed / (10_000 * 365 days);
         return p.claimableAmount + accrued;
     }
 
@@ -709,10 +697,6 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         opsRole[wallet] = enabled;
     }
 
-    /// @dev Deprecated — referral rates are now managed off-chain. Kept as no-op for ABI compatibility.
-    function setReferralRates(uint256, uint256, uint256, uint256, uint256) external onlyOwner {}
-
-
     function setUri(string calldata newUri) external onlyOwner { uri = newUri; }
     function setUsdc(address _usdc)         external onlyOwner { usdc = IERC20(_usdc); }
     function setTreasury(address _treasury) external onlyOwner { treasury = _treasury; }
@@ -731,18 +715,35 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     ///      principal changes reset the accrual window without forcing a claim.
     function _settleAndAccrue(uint8 tier, uint256 serial) internal {
         Position storage p = positions[tier][serial];
-        uint256 accrued = p.usdcPrincipal * p.snapshotApyBps * (block.timestamp - p.lastClaimAt)
+        // BVI-5: fixed-term positions stop accruing after unlockedAt
+        uint256 end = block.timestamp;
+        bool atExpiry = false;
+        if (!p.isFlexible && p.unlockedAt > 0 && end > p.unlockedAt) {
+            end = p.unlockedAt;
+            atExpiry = true;
+        }
+        if (end <= p.lastClaimAt) return;  // already settled through effective end
+        uint256 accrued = p.usdcPrincipal * p.snapshotApyBps * (end - p.lastClaimAt)
                           / (10_000 * 365 days);
-        p.lastClaimAt = block.timestamp;
-        if (accrued > 0) p.claimableAmount += accrued;
+        // Always advance lastClaimAt regardless of accrued amount.
+        // Leaving it at openedAt when accrued == 0 (e.g. dust principal) would allow a
+        // retroactive-inflation attack: deposit a large principal just before expiry, then
+        // close and collect interest computed over the entire term at the new principal.
+        p.lastClaimAt = end;
+        if (accrued > 0) {
+            p.claimableAmount += accrued;
+        }
     }
 
     /// @dev Pay out claimableAmount + newly accrued interest. Used by claim / close.
     function _settleAndPay(uint8 tier, uint256 serial, address to) internal returns (uint256 interest) {
         Position storage p = positions[tier][serial];
-        uint256 accrued = p.usdcPrincipal * p.snapshotApyBps * (block.timestamp - p.lastClaimAt)
-                          / (10_000 * 365 days);
-        p.lastClaimAt = block.timestamp;
+        // BVI-5: fixed-term positions stop accruing after unlockedAt
+        uint256 end = block.timestamp;
+        if (!p.isFlexible && p.unlockedAt > 0 && end > p.unlockedAt) end = p.unlockedAt;
+        uint256 elapsed = end > p.lastClaimAt ? end - p.lastClaimAt : 0;
+        uint256 accrued = p.usdcPrincipal * p.snapshotApyBps * elapsed / (10_000 * 365 days);
+        p.lastClaimAt = end;  // always advance on explicit pay
         interest = p.claimableAmount + accrued;
         p.claimableAmount = 0;
         if (interest > 0) {
@@ -757,6 +758,21 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         _ownedSerials[to][tier].push(serial);
         _balances[to][tier]++;
         emit TransferSingle(msg.sender, address(0), to, tier, 1);
+    }
+
+    /// @dev ERC-1155-compliant burn: removes the card from `from` without crediting address(0).
+    ///      Used by synthesizeCard to correctly burn input cards (BVI-12).
+    function _burnCard(address from, uint8 tier, uint256 serial) internal {
+        uint256[] storage fromList = _ownedSerials[from][tier];
+        uint256 idx        = _ownedSerialIndex[tier][serial];
+        uint256 lastSerial = fromList[fromList.length - 1];
+        fromList[idx]                       = lastSerial;
+        _ownedSerialIndex[tier][lastSerial] = idx;
+        fromList.pop();
+        delete _ownedSerialIndex[tier][serial];
+        delete cardOwner[tier][serial];
+        _balances[from][tier]--;
+        emit TransferSingle(msg.sender, from, address(0), tier, 1);
     }
 
     function _transferCard(address from, address to, uint8 tier, uint256 serial) internal {
@@ -819,7 +835,11 @@ contract BiliquidVIPCard is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     }
 
     function _claimInterestLegacy(address wallet, uint256 stakeId, StakeRecord storage rec) internal {
-        uint256 monthsPast = (block.timestamp - rec.lastClaimAt) / SECONDS_PER_MONTH;
+        // BVI-10: fixed-term non-member stakes stop accruing interest after unlockedAt
+        uint256 claimEnd = block.timestamp;
+        if (!rec.isFlexible && claimEnd > rec.unlockedAt) claimEnd = rec.unlockedAt;
+        if (claimEnd <= rec.lastClaimAt) return;  // already settled through effective end
+        uint256 monthsPast = (claimEnd - rec.lastClaimAt) / SECONDS_PER_MONTH;
         if (monthsPast == 0) return;
         uint256 daysPast = monthsPast * 30;
         uint256 interest = _dailyInterest(rec) * daysPast;

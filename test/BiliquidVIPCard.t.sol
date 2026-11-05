@@ -93,6 +93,43 @@ contract BiliquidVIPCardTest is Test {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    //  CMD-3 (BiliquidVIPCard): Ownable2Step — two-step ownership transfer
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_cmd3_card_transferOwnership_isTwoStep() public {
+        address newOwner = address(0xCAFE);
+        vm.prank(owner_);
+        card.transferOwnership(newOwner);
+        assertEq(card.owner(),        owner_,   "owner unchanged until accepted");
+        assertEq(card.pendingOwner(), newOwner, "newOwner is pendingOwner");
+    }
+
+    function test_cmd3_card_ownershipNotEffectiveUntilAccepted() public {
+        address newOwner = address(0xCAFE);
+        vm.prank(owner_); card.transferOwnership(newOwner);
+        vm.prank(newOwner);
+        vm.expectRevert();
+        card.setPaused(true); // onlyOwner — must fail before accept
+    }
+
+    function test_cmd3_card_acceptOwnership_completes_transfer() public {
+        address newOwner = address(0xCAFE);
+        vm.prank(owner_); card.transferOwnership(newOwner);
+        vm.prank(newOwner); card.acceptOwnership();
+        assertEq(card.owner(),        newOwner,    "ownership transferred");
+        assertEq(card.pendingOwner(), address(0),  "pendingOwner cleared");
+    }
+
+    function test_cmd3_card_onlyPendingOwner_can_accept() public {
+        address newOwner = address(0xCAFE);
+        address attacker = address(0xBEEF);
+        vm.prank(owner_); card.transferOwnership(newOwner);
+        vm.prank(attacker);
+        vm.expectRevert();
+        card.acceptOwnership();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     //  INITIALIZATION
     // ═══════════════════════════════════════════════════════════════════════════
 
@@ -623,19 +660,19 @@ contract BiliquidVIPCardTest is Test {
     // ═══════════════════════════════════════════════════════════════════════════
 
     function test_giftCard_directMint() public {
-        // giftCard now mints directly to recipient (no adminMintToPool needed)
-        uint256 serialBefore = card.nextSerial(1);
+        // giftCard now uses nextFreeSerial (not nextSerial), so it does not touch mintCap quota
+        uint256 freeSerialBefore = card.nextFreeSerial(1);
         vm.prank(owner_); card.giftCard(1, bob);
-        assertEq(card.cardOwner(1, serialBefore), bob);
-        assertEq(card.nextSerial(1), serialBefore + 1);
+        assertEq(card.cardOwner(1, freeSerialBefore), bob);
+        assertEq(card.nextFreeSerial(1), freeSerialBefore + 1);
     }
 
     function test_giftCard_opsRole() public {
         address ops = address(0xBEEF);
         vm.prank(owner_); card.setOpsRole(ops, true);
-        uint256 serialBefore = card.nextSerial(2);
+        uint256 freeSerialBefore = card.nextFreeSerial(2);
         vm.prank(ops); card.giftCard(2, alice);
-        assertEq(card.cardOwner(2, serialBefore), alice);
+        assertEq(card.cardOwner(2, freeSerialBefore), alice);
     }
 
     function test_giftCard_rejects_non_ops() public {
@@ -972,6 +1009,362 @@ contract BiliquidVIPCardTest is Test {
         vm.prank(alice);
         vm.expectRevert(BiliquidVIPCard.SynthTierInvalid.selector);
         card.synthesizeCard(diamond, four);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  BVI-7: addToPosition reverts on expired fixed-term positions
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_bvi7_addToPosition_afterExpiry_reverts() public {
+        uint256 serial = _aliceLockGold();
+        vm.prank(alice); card.openPosition(1, serial, 3, 100_000_000);
+
+        // Warp past expiry
+        vm.warp(block.timestamp + 3 * SECONDS_PER_MONTH + 1);
+
+        vm.prank(alice);
+        vm.expectRevert(BiliquidVIPCard.PositionExpired.selector);
+        card.addToPosition(1, serial, 1_000_000);
+    }
+
+    function test_bvi7_addToPosition_beforeExpiry_stillWorks() public {
+        uint256 serial = _aliceLockGold();
+        vm.prank(alice); card.openPosition(1, serial, 3, 100_000_000);
+
+        // Warp to just before expiry
+        vm.warp(block.timestamp + 3 * SECONDS_PER_MONTH - 1);
+
+        vm.prank(alice); card.addToPosition(1, serial, 1_000_000); // must not revert
+        assertEq(card.getPosition(1, serial).usdcPrincipal, 101_000_000);
+    }
+
+    function test_bvi7_addToPosition_flexible_always_allowed() public {
+        vm.prank(owner_); card.setMemberFlexibleStaking(true, 900);
+        uint256 serial = _aliceLockGold();
+        vm.prank(alice); card.openPosition(1, serial, 0, 100_000_000); // flexible
+
+        // Flexible positions have no expiry — addToPosition must always work
+        vm.warp(block.timestamp + 365 days * 5);
+        vm.prank(alice); card.addToPosition(1, serial, 1_000_000);
+        assertEq(card.getPosition(1, serial).usdcPrincipal, 101_000_000);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  BVI-5: member interest stops accruing after unlockedAt for fixed-term positions
+    //  BVI-11: lastClaimAt only advances when accrued > 0
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_bvi5_no_interest_after_unlocked() public {
+        uint256 serial = _aliceLockGold();
+        uint256 amount = 100_000_000;
+        vm.prank(alice); card.openPosition(1, serial, 3, amount); // 3-month fixed
+
+        uint256 unlockedAt = block.timestamp + 3 * SECONDS_PER_MONTH;
+        // Warp well past expiry
+        vm.warp(unlockedAt + 365 days);
+
+        // pendingMemberInterest must be capped at exactly 3 months of interest
+        uint256 pending = card.pendingMemberInterest(1, serial);
+        uint256 maxInterest = amount * 900 * (3 * SECONDS_PER_MONTH) / (10_000 * 365 days);
+        assertEq(pending, maxInterest, "interest must not accrue past expiry");
+    }
+
+    function test_bvi5_claimAfterExpiry_onlyPreExpiryInterest() public {
+        uint256 serial = _aliceLockGold();
+        uint256 amount = 100_000_000;
+        vm.prank(alice); card.openPosition(1, serial, 3, amount);
+
+        uint256 unlockedAt = block.timestamp + 3 * SECONDS_PER_MONTH;
+        vm.warp(unlockedAt + 5 * SECONDS_PER_DAY); // 5 days past expiry
+
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        vm.prank(alice); card.claimMemberInterest(1, serial);
+        uint256 received = usdc.balanceOf(alice) - aliceBefore;
+
+        // Expected: only the 3-month window (90 days in seconds), not 95 days
+        uint256 expected = uint256(amount) * 900 * 5 * SECONDS_PER_DAY / (10_000 * 365 days) * (3 * 30);
+        // Simpler: exact 3-month interest
+        uint256 exactThreeMonth = amount * 900 * (3 * SECONDS_PER_MONTH) / (10_000 * 365 days);
+        assertEq(received, exactThreeMonth, "only pre-expiry interest paid");
+    }
+
+    function test_bvi5_flexible_position_accrues_indefinitely() public {
+        // Enable member flexible staking (disabled by default)
+        vm.prank(owner_); card.setMemberFlexibleStaking(true, 900);
+
+        uint256 serial = _aliceLockGold();
+        uint256 amount = 100_000_000;
+        vm.prank(alice); card.openPosition(1, serial, 0, amount); // 0 = flexible
+
+        vm.warp(block.timestamp + 400 days); // >1 year
+
+        uint256 pending = card.pendingMemberInterest(1, serial);
+        uint256 expectedFlexible = amount * 900 * 400 days / (10_000 * 365 days);
+        assertEq(pending, expectedFlexible, "flexible position accrues beyond 365 days");
+    }
+
+    function test_bvi11_lastClaimAt_does_not_advance_on_zero_accrual() public {
+        uint256 serial = _aliceLockGold();
+        uint256 amount = 100_000_000;
+        vm.prank(alice); card.openPosition(1, serial, 3, amount);
+
+        uint256 lastClaimAtBefore = card.getPosition(1, serial).lastClaimAt;
+
+        // addToPosition at the same timestamp (zero elapsed → zero accrual) must not advance lastClaimAt
+        usdc.mint(alice, 1_000_000);
+        vm.prank(alice); usdc.approve(address(card), 1_000_000);
+        vm.prank(alice); card.addToPosition(1, serial, 1_000_000);
+
+        uint256 lastClaimAtAfter = card.getPosition(1, serial).lastClaimAt;
+        assertEq(lastClaimAtAfter, lastClaimAtBefore, "lastClaimAt must not advance on zero accrual");
+    }
+
+    function test_bvi11_interest_not_lost_on_rapid_addToPosition() public {
+        uint256 serial = _aliceLockGold();
+        uint256 amount = 100_000_000;
+        vm.prank(alice); card.openPosition(1, serial, 3, amount);
+
+        // Warp 30 days, then add to position (should accrue 30 days of interest)
+        vm.warp(block.timestamp + 30 days);
+        uint256 expectedAccrued = amount * 900 * 30 days / (10_000 * 365 days);
+
+        vm.prank(alice); card.addToPosition(1, serial, 1_000_000);
+
+        // claimableAmount must capture the 30-day accrual before the add
+        BiliquidVIPCard.Position memory pos = card.getPosition(1, serial);
+        assertEq(pos.claimableAmount, expectedAccrued, "30 days interest captured in claimableAmount");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  BVI-12: synthesizeCard properly burns cards (no address(0) credit)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_bvi12_synthesize_does_not_credit_zero_address() public {
+        // Mint 4 Gold cards and synthesize — burned cards must not appear in address(0) balance
+        vm.startPrank(alice);
+        card.mintCard(1, 4);
+        uint256[] memory golds = card.getCardsByOwner(alice, 1);
+        card.synthesizeCard(1, golds);
+        vm.stopPrank();
+
+        // address(0) must own 0 Gold cards (not 4)
+        assertEq(card.balanceOf(address(0), 1), 0, "address(0) balance must be 0");
+        // burned serials must have no owner
+        for (uint256 i = 0; i < golds.length; i++) {
+            assertEq(card.cardOwner(1, golds[i]), address(0), "burned card has no owner");
+        }
+    }
+
+    function test_bvi12_burned_cards_have_no_owner() public {
+        // After synthesis, burned Gold serials must not be present in any list
+        vm.startPrank(alice);
+        card.mintCard(1, 4);
+        uint256[] memory golds = card.getCardsByOwner(alice, 1);
+        card.synthesizeCard(1, golds);
+        vm.stopPrank();
+
+        // Alice should have 0 Gold cards remaining
+        assertEq(card.getCardsByOwner(alice, 1).length, 0, "alice has no gold left");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  BVI-13: giftCard uses nextFreeSerial, not nextSerial
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_giftCard_doesNotConsumeNextSerial() public {
+        uint256 paidSerialBefore = card.nextSerial(1);
+        vm.prank(owner_); card.giftCard(1, bob);
+        // nextSerial (paid-mint quota) must be unchanged
+        assertEq(card.nextSerial(1), paidSerialBefore, "paid serial counter must be unchanged");
+        // nextFreeSerial must have advanced
+        assertEq(card.nextFreeSerial(1), card.FREE_SERIAL_OFFSET() + 1, "free serial advanced");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  BVI-1: synthesizeCard uses nextFreeSerial for the new card's serial
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_bvi1_synthesize_doesNotConsumeNextSerial() public {
+        // Mint 4 Gold cards (paid-mint) and synthesize into one Platinum
+        vm.startPrank(alice);
+        card.mintCard(1, 4); // mint 4 Gold cards (serials 1..4)
+        uint256 paidSerialBefore = card.nextSerial(2); // Platinum paid counter
+        uint256 freeSerialBefore = card.nextFreeSerial(2); // Platinum free counter
+
+        uint256[] memory golds = card.getCardsByOwner(alice, 1);
+        card.synthesizeCard(1, golds);
+        vm.stopPrank();
+
+        // paid-mint quota for Platinum must be unchanged
+        assertEq(card.nextSerial(2), paidSerialBefore, "platinum paid serial unchanged");
+        // free serial counter advanced by 1
+        assertEq(card.nextFreeSerial(2), freeSerialBefore + 1, "free serial advanced");
+        // Alice owns the new Platinum at the free serial slot
+        assertEq(card.cardOwner(2, freeSerialBefore), alice, "alice owns synthesized platinum");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  BVI-10: non-member fixed-term interest stops at unlockedAt
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_bvi10_nonMember_noInterestAfterExpiry() public {
+        vm.prank(bob); card.stakeNonMember(3); // 3-month fixed stake
+        BiliquidVIPCard.StakeRecord[] memory recs = card.getStakeRecords(bob);
+        uint256 unlockedAt = recs[0].unlockedAt;
+
+        // Claim just at expiry — should work
+        vm.warp(unlockedAt);
+        uint256 bobBefore = usdc.balanceOf(bob);
+        vm.prank(bob); card.claimInterest(0);
+        uint256 atExpiryClaim = usdc.balanceOf(bob) - bobBefore;
+
+        // Warp far past expiry and claim again — must get zero additional
+        vm.warp(unlockedAt + 365 days);
+        bobBefore = usdc.balanceOf(bob);
+        vm.prank(bob); card.claimInterest(0);
+        uint256 postExpiryClaim = usdc.balanceOf(bob) - bobBefore;
+
+        assertEq(postExpiryClaim, 0, "no interest after fixed-term expiry");
+        // Sanity: the at-expiry claim must have been non-zero
+        assertGt(atExpiryClaim, 0, "interest earned before expiry");
+    }
+
+    function test_bvi10_nonMember_unstake_afterExpiry_noExtraInterest() public {
+        vm.prank(bob); card.stakeNonMember(3);
+        BiliquidVIPCard.StakeRecord[] memory recs = card.getStakeRecords(bob);
+        uint256 unlockedAt = recs[0].unlockedAt;
+
+        // Claim at expiry to lock in pre-expiry interest
+        vm.warp(unlockedAt);
+        vm.prank(bob); card.claimInterest(0);
+
+        // Warp 1 extra year past expiry, then unstake
+        vm.warp(unlockedAt + 365 days);
+        uint256 bobBefore = usdc.balanceOf(bob);
+        vm.prank(bob); card.unstakeNonMember(0);
+
+        // Should receive principal only (no post-expiry interest)
+        uint256 received = usdc.balanceOf(bob) - bobBefore;
+        assertEq(received, NON_MEMBER_AMOUNT, "only principal returned, no post-expiry interest");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  BVI-2: non-member fixed-term drops partial (< 30-day) period interest
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_bvi2_unstake_drops_partial_period() public {
+        // Stake flexible (no lock) to avoid StillLocked on early unstake
+        vm.prank(bob); card.stakeNonMember(0); // flexible
+        // Warp 45 days — only 1 complete 30-day month, 15-day partial dropped
+        vm.warp(block.timestamp + 45 days);
+        uint256 bobBefore = usdc.balanceOf(bob);
+        vm.prank(bob); card.unstakeNonMember(0);
+        uint256 received = usdc.balanceOf(bob) - bobBefore;
+        // Expected: principal + 1 month interest only (not 1.5 months)
+        (,, uint256 flexibleApyBps,) = card.nonMemberConfig();
+        uint256 dailyInterest = NON_MEMBER_AMOUNT * flexibleApyBps / (10_000 * 365);
+        uint256 expectedInterest = dailyInterest * 30; // 1 complete month = 30 days
+        assertEq(received, NON_MEMBER_AMOUNT + expectedInterest, "partial 30-day period dropped");
+    }
+
+    function test_bvi2_unstake_pays_exactly_whole_months() public {
+        // Stake flexible, warp exactly 3 months — all 3 months should be paid
+        vm.prank(bob); card.stakeNonMember(0);
+        vm.warp(block.timestamp + 3 * SECONDS_PER_MONTH);
+        uint256 bobBefore = usdc.balanceOf(bob);
+        vm.prank(bob); card.unstakeNonMember(0);
+        uint256 received = usdc.balanceOf(bob) - bobBefore;
+        (,, uint256 flexibleApyBps2,) = card.nonMemberConfig();
+        uint256 dailyInterest = NON_MEMBER_AMOUNT * flexibleApyBps2 / (10_000 * 365);
+        uint256 expectedInterest = dailyInterest * 90; // 3 months × 30 days
+        assertEq(received, NON_MEMBER_AMOUNT + expectedInterest, "exactly 3 months interest");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  BVI-5 (follow-up): upgradeTerms must revert on expired fixed-term positions
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_bvi5_upgradeTerms_afterExpiry_reverts() public {
+        uint256 serial = _aliceLockGold();
+        uint256 openedAt = block.timestamp;
+        vm.prank(alice); card.openPosition(1, serial, 3, 100_000_000);
+
+        // Warp past the 3-month expiry
+        vm.warp(openedAt + 3 * SECONDS_PER_MONTH + 1);
+
+        vm.prank(alice);
+        vm.expectRevert(BiliquidVIPCard.PositionExpired.selector);
+        card.upgradeTerms(1, serial, 6);
+    }
+
+    function test_bvi5_upgradeTerms_beforeExpiry_stillWorks() public {
+        uint256 serial = _aliceLockGold();
+        uint256 openedAt = block.timestamp;
+        vm.prank(alice); card.openPosition(1, serial, 3, 100_000_000);
+
+        // Warp to just before expiry
+        vm.warp(openedAt + 3 * SECONDS_PER_MONTH - 1);
+
+        vm.prank(alice); card.upgradeTerms(1, serial, 6);
+
+        BiliquidVIPCard.Position memory pos = card.getPosition(1, serial);
+        assertEq(pos.termMonths, 6, "term upgraded before expiry");
+        assertEq(pos.unlockedAt, pos.openedAt + 6 * SECONDS_PER_MONTH, "new unlockedAt set correctly");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  BVI-11 (regression): retroactive-inflation via dust principal + addToPosition
+    //  Attack: open with 1 wei → lastClaimAt stays at openedAt (accrued==0) →
+    //          add large principal just before expiry → close → interest on full
+    //          term at new principal.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function test_bvi11_dustPrincipal_addBeforeExpiry_noRetroactiveInterest() public {
+        uint256 serial = _aliceLockGold();
+        uint256 openedAt = block.timestamp;
+
+        // Open with 1 wei principal
+        usdc.mint(alice, 1);
+        vm.prank(alice); usdc.approve(address(card), 1);
+        vm.prank(alice); card.openPosition(1, serial, 3, 1);
+
+        // Warp to 1 second before expiry; addToPosition with a large amount
+        uint256 expiry = openedAt + 3 * SECONDS_PER_MONTH;
+        vm.warp(expiry - 1);
+
+        uint256 bigDeposit = 100_000_000; // 100 USDC
+        usdc.mint(alice, bigDeposit);
+        vm.prank(alice); usdc.approve(address(card), bigDeposit);
+        vm.prank(alice); card.addToPosition(1, serial, bigDeposit);
+
+        // Close at expiry — interest should only be ~1 second on bigDeposit,
+        // NOT the entire 3-month term.
+        vm.warp(expiry + 1);
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        vm.prank(alice); card.closePosition(1, serial);
+        uint256 received = usdc.balanceOf(alice) - aliceBefore;
+
+        // Principal returned = 1 + bigDeposit
+        uint256 principal = 1 + bigDeposit;
+        assertGe(received, principal, "at least principal returned");
+
+        // Interest must be tiny (at most 1 second on bigDeposit at any APY)
+        // Max reasonable: 100 USDC * 30% APY * 2 seconds / (365 days) ≈ 0.002 USDC = 2000 units
+        uint256 interest = received - principal;
+        assertLt(interest, 3000, "interest must be near-zero, not full-term retroactive");
+    }
+
+    function test_bvi5_upgradeTerms_atExactExpiry_reverts() public {
+        uint256 serial = _aliceLockGold();
+        uint256 openedAt = block.timestamp;
+        vm.prank(alice); card.openPosition(1, serial, 3, 100_000_000);
+
+        // Warp to exactly unlockedAt (inclusive boundary is expired)
+        vm.warp(openedAt + 3 * SECONDS_PER_MONTH);
+
+        vm.prank(alice);
+        vm.expectRevert(BiliquidVIPCard.PositionExpired.selector);
+        card.upgradeTerms(1, serial, 6);
     }
 
 }
